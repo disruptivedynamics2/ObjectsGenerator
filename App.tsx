@@ -440,50 +440,52 @@ const App: React.FC = () => {
       <div className="w-full max-w-5xl">
         {/* === IDLE: File upload with drag & drop === */}
         {appState === AppState.IDLE && (
-          <div
-            onDrop={handleDrop}
-            onDragOver={handleDragOver}
-            onDragLeave={handleDragLeave}
-            className={`bg-white rounded-3xl shadow-xl p-10 text-center border-2 border-dashed transition-all ${
-              isDragOver ? 'border-indigo-500 bg-indigo-50 scale-[1.02]' : 'border-slate-200 hover:border-indigo-200'
-            }`}
-          >
-            <div className="w-20 h-20 bg-indigo-50 rounded-full flex items-center justify-center mx-auto mb-6">
-              <Upload className="w-10 h-10 text-indigo-600" />
-            </div>
-            <h2 className="text-2xl font-bold text-slate-900 mb-2">
-              {isDragOver ? 'Déposez votre fichier ici' : 'Importez votre fichier'}
-            </h2>
-            <p className="text-slate-500 mb-4 text-sm">Glissez-déposez un fichier ou cliquez pour sélectionner</p>
-            <div className="flex justify-center gap-4 mb-8">
-              <div className="flex flex-col items-center opacity-60">
-                <FileText className="w-6 h-6 mb-1 text-red-500" />
-                <span className="text-[10px] font-bold">PDF</span>
-              </div>
-              <div className="flex flex-col items-center opacity-60">
-                <FileCode className="w-6 h-6 mb-1 text-blue-500" />
-                <span className="text-[10px] font-bold">DOCX</span>
-              </div>
-              <div className="flex flex-col items-center opacity-60">
-                <FileText className="w-6 h-6 mb-1 text-slate-500" />
-                <span className="text-[10px] font-bold">TXT</span>
-              </div>
-            </div>
-
-            <input type="file" accept=".pdf,.docx,.txt" ref={fileInputRef} onChange={handleFileUpload} className="hidden" />
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              className="inline-flex items-center px-8 py-4 bg-indigo-600 text-white rounded-xl font-semibold shadow-lg hover:bg-indigo-700 hover:shadow-indigo-500/30 transition-all transform hover:-translate-y-1"
+          <>
+            <div
+              onDrop={handleDrop}
+              onDragOver={handleDragOver}
+              onDragLeave={handleDragLeave}
+              className={`bg-white rounded-3xl shadow-xl p-10 text-center border-2 border-dashed transition-all ${
+                isDragOver ? 'border-indigo-500 bg-indigo-50 scale-[1.02]' : 'border-slate-200 hover:border-indigo-200'
+              }`}
             >
-              <Upload className="w-5 h-5 mr-2" />
-              Sélectionner un fichier
-            </button>
-          </div>
+              <div className="w-20 h-20 bg-indigo-50 rounded-full flex items-center justify-center mx-auto mb-6">
+                <Upload className="w-10 h-10 text-indigo-600" />
+              </div>
+              <h2 className="text-2xl font-bold text-slate-900 mb-2">
+                {isDragOver ? 'Déposez votre fichier ici' : 'Importez votre fichier'}
+              </h2>
+              <p className="text-slate-500 mb-4 text-sm">Glissez-déposez un fichier ou cliquez pour sélectionner</p>
+              <div className="flex justify-center gap-4 mb-8">
+                <div className="flex flex-col items-center opacity-60">
+                  <FileText className="w-6 h-6 mb-1 text-red-500" />
+                  <span className="text-[10px] font-bold">PDF</span>
+                </div>
+                <div className="flex flex-col items-center opacity-60">
+                  <FileCode className="w-6 h-6 mb-1 text-blue-500" />
+                  <span className="text-[10px] font-bold">DOCX</span>
+                </div>
+                <div className="flex flex-col items-center opacity-60">
+                  <FileText className="w-6 h-6 mb-1 text-slate-500" />
+                  <span className="text-[10px] font-bold">TXT</span>
+                </div>
+              </div>
 
-          {/* Prompt Generator — create prompt files automatically */}
-          <div className="mt-8">
-            <PromptGenerator />
-          </div>
+              <input type="file" accept=".pdf,.docx,.txt" ref={fileInputRef} onChange={handleFileUpload} className="hidden" />
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="inline-flex items-center px-8 py-4 bg-indigo-600 text-white rounded-xl font-semibold shadow-lg hover:bg-indigo-700 hover:shadow-indigo-500/30 transition-all transform hover:-translate-y-1"
+              >
+                <Upload className="w-5 h-5 mr-2" />
+                Sélectionner un fichier
+              </button>
+            </div>
+
+            {/* Prompt Generator — create prompt files automatically */}
+            <div className="mt-8">
+              <PromptGenerator />
+            </div>
+          </>
         )}
 
         {/* === ANALYZING === */}
