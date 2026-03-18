@@ -1,5 +1,5 @@
 
-import React, { useState, useRef, useCallback } from 'react';
+import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { Upload, FileText, Image as ImageIcon, Download, Loader2, CheckCircle2, AlertCircle, ArrowLeft, Layers, PlayCircle, Monitor, Tv, Zap, FileCode, Clock, CloudUpload, Timer } from 'lucide-react';
 import { extractTextFromFile } from './services/fileService';
 import { analyzePdfContent, generateImageForPrompt } from './services/geminiService';
@@ -7,6 +7,7 @@ import { downloadZip, downloadPdf, downloadGlobalZip, downloadMergedPdf } from '
 import { createBatchJob, pollBatchJob, cancelBatchJob } from './services/batchService';
 import { authenticateGoogleDrive, isDriveAuthenticated, uploadBatchResultsToDrive } from './services/driveService';
 import { ApiKeySelector } from './components/ApiKeySelector';
+import { PromptGenerator } from './components/PromptGenerator';
 import { PromptGroup, GeneratedImage, AppState, ImageSize, ImageModel, GenerationMode, BatchJob, BatchJobState } from './types';
 
 // Pricing per image (verified from official Google API docs)
@@ -54,6 +55,18 @@ const App: React.FC = () => {
   const [isDragOver, setIsDragOver] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Listen for generated prompts from the PromptGenerator component
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const customEvent = event as CustomEvent<{ file: File }>;
+      if (customEvent.detail?.file) {
+        processFile(customEvent.detail.file);
+      }
+    };
+    window.addEventListener('promptsFileGenerated', handler);
+    return () => window.removeEventListener('promptsFileGenerated', handler);
+  }, []);
 
   const calculateCost = useCallback((count: number) => {
     const perImage = PRICING[selectedModel][selectedResolution];
@@ -465,6 +478,11 @@ const App: React.FC = () => {
               <Upload className="w-5 h-5 mr-2" />
               Sélectionner un fichier
             </button>
+          </div>
+
+          {/* Prompt Generator — create prompt files automatically */}
+          <div className="mt-8">
+            <PromptGenerator />
           </div>
         )}
 
