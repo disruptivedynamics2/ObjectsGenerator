@@ -101,6 +101,69 @@ const downloadBlob = (blob: Blob, filename: string) => {
   document.body.removeChild(link);
 };
 
+/**
+ * Adds a single slide (page) to the PDF with a 3-view image, labels, dimensions, and prompt.
+ */
+const addSlideToDoc = (
+  doc: any,
+  img: GeneratedImage,
+  imageBase64: string,
+  viewLabels: string[],
+  group: PromptGroup,
+  slideSubtitle?: string
+) => {
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const margin = 10;
+  const availableWidth = pageWidth - (margin * 2);
+  const item = group.items[img.itemId];
+
+  // Header
+  doc.setFontSize(16);
+  doc.setTextColor(0, 0, 0);
+  const title = slideSubtitle
+    ? `${item.name} — ${slideSubtitle}`
+    : item.name;
+  doc.text(title, 10, 12);
+
+  // Image
+  const imgWidth = availableWidth;
+  const imgHeight = 120;
+  try {
+    doc.addImage(imageBase64, 'PNG', margin, 18, imgWidth, imgHeight, undefined, 'FAST');
+  } catch (e) {
+    console.error("Error adding image to PDF", e);
+  }
+
+  // View labels
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(10);
+  doc.setTextColor(50);
+  const labelY = 18 + imgHeight + 8;
+  if (viewLabels.length >= 3) {
+    doc.text(viewLabels[0], margin + (imgWidth / 6), labelY, { align: 'center' });
+    doc.text(viewLabels[1], margin + (imgWidth / 2), labelY, { align: 'center' });
+    doc.text(viewLabels[2], margin + (5 * imgWidth / 6), labelY, { align: 'center' });
+  }
+
+  // Dimensions
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(11);
+  doc.setTextColor(0);
+  const dimensionsY = labelY + 10;
+  const dims = item.dimensions || "--- x --- x ---";
+  doc.text(`Longueur (cm) × Largeur (cm) × hauteur (cm) : ${dims}`, pageWidth / 2, dimensionsY, { align: 'center' });
+
+  // Prompt
+  doc.setFontSize(9);
+  doc.setTextColor(80);
+  const pageHeight = doc.internal.pageSize.getHeight();
+  const splitPrompt = doc.splitTextToSize(`Prompt: ${img.prompt}`, availableWidth);
+  const lineHeight = 4;
+  const totalPromptHeight = splitPrompt.length * lineHeight;
+  const promptY = pageHeight - margin - totalPromptHeight + lineHeight;
+  doc.text(splitPrompt, margin, promptY);
+};
+
 const addGroupToPdf = (doc: any, group: PromptGroup, images: GeneratedImage[], forceNewPage: boolean) => {
   const pageWidth = doc.internal.pageSize.getWidth();
   const margin = 10;
@@ -108,68 +171,40 @@ const addGroupToPdf = (doc: any, group: PromptGroup, images: GeneratedImage[], f
 
   // Section Title Page
   if (forceNewPage) doc.addPage();
-  
-  doc.setFillColor(240, 240, 250); 
+
+  doc.setFillColor(240, 240, 250);
   doc.rect(0, 0, pageWidth, doc.internal.pageSize.getHeight(), 'F');
-  
+
   doc.setFontSize(24);
   doc.setTextColor(50, 50, 80);
   doc.text(`Section ${group.id}`, pageWidth / 2, doc.internal.pageSize.getHeight() / 2 - 10, { align: 'center' });
   doc.setFontSize(32);
   doc.setTextColor(30, 30, 100);
-  // Wrap text for long group names
   const splitTitle = doc.splitTextToSize(group.name, availableWidth);
   doc.text(splitTitle, pageWidth / 2, doc.internal.pageSize.getHeight() / 2 + 5, { align: 'center' });
-  
+
   doc.addPage();
 
   // Images
   images.forEach((img, index) => {
-    if (index > 0) doc.addPage(); 
+    if (index > 0) doc.addPage();
 
-    // Header
-    doc.setFontSize(16);
-    doc.setTextColor(0, 0, 0);
-    const title = `${group.items[img.itemId].name}`;
-    doc.text(title, 10, 12);
+    // Slide 1 — always present (views 1-3 or the standard 3-view)
+    const slide1Labels = img.base64Slide2
+      ? ['3/4 AVANT HAUT', '3/4 AVANT BAS', '3/4 ARRIÈRE HAUT']
+      : ['VUE DE FACE (0°)', 'VUE DE PROFIL DROIT (90°)', 'VUE ARRIÈRE (180°)'];
 
-    // Image - Scaled to fit and leave room for text
-    const imgWidth = availableWidth;
-    const imgHeight = 120; // Increased height to fill space
-    try {
-        doc.addImage(img.base64, 'PNG', margin, 18, imgWidth, imgHeight, undefined, 'FAST');
-    } catch (e) {
-        console.error("Error adding image to PDF", e);
+    addSlideToDoc(doc, img, img.base64, slide1Labels, group, img.base64Slide2 ? 'Vues 1-3' : undefined);
+
+    // Slide 2 — only for 6-view ComfyUI results
+    if (img.base64Slide2) {
+      doc.addPage();
+      addSlideToDoc(
+        doc, img, img.base64Slide2,
+        ['3/4 ARRIÈRE BAS', 'PROFIL', 'DESSUS'],
+        group,
+        'Vues 4-6'
+      );
     }
-
-    // Labels for the 3 views
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(10);
-    doc.setTextColor(50);
-    const labelY = 18 + imgHeight + 8;
-    doc.text("VUE DE FACE (0°)", margin + (imgWidth / 6), labelY, { align: 'center' });
-    doc.text("VUE DE PROFIL DROIT (90°)", margin + (imgWidth / 2), labelY, { align: 'center' });
-    doc.text("VUE ARRIÈRE (180°)", margin + (5 * imgWidth / 6), labelY, { align: 'center' });
-
-    // Dimensions
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(11);
-    doc.setTextColor(0);
-    const dimensionsY = labelY + 10;
-    
-    const item = group.items[img.itemId];
-    const dims = item.dimensions || "--- x --- x ---";
-    doc.text(`Longueur (cm) × Largeur (cm) × hauteur (cm) : ${dims}`, pageWidth / 2, dimensionsY, { align: 'center' });
-
-    // Prompt (Font 9 as requested, anchored to the absolute bottom)
-    doc.setFontSize(9);
-    doc.setTextColor(80);
-    const pageHeight = doc.internal.pageSize.getHeight();
-    const splitPrompt = doc.splitTextToSize(`Prompt: ${img.prompt}`, availableWidth);
-    // Calculate Y to be at the bottom, accounting for multiple lines
-    const lineHeight = 4; // mm
-    const totalPromptHeight = splitPrompt.length * lineHeight;
-    const promptY = pageHeight - margin - totalPromptHeight + lineHeight;
-    doc.text(splitPrompt, margin, promptY);
   });
 };

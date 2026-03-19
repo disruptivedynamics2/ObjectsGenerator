@@ -2,13 +2,26 @@
  * ComfyUI integration service.
  * Connects to a local ComfyUI instance via its REST/WebSocket API.
  *
- * Supported model presets:
- * 1. Flux 2 + Multi-Angles LoRA v2  — best for photorealistic single-pass 3-view
- * 2. SDXL + MV-Adapter              — purpose-built multi-view (front/right/back)
- * 3. Qwen-Image-Edit                — reference image editing for high-coherence pass 2
+ * Uses the Qwen-Image-Edit-2511 Multiple Angles workflow:
+ * - Generates individual views at specific camera angles from a reference image
+ * - Each view is a separate KSampler pass with QwenMultiangleCameraNode
+ * - Results are fetched individually and can be stitched into a single 3-view image
+ *
+ * Required models (auto-downloaded by the workflow):
+ * - Qwen-Image-Edit-2511-FP8_e4m3fn.safetensors (diffusion model)
+ * - qwen_2.5_vl_7b_fp8_scaled.safetensors (CLIP)
+ * - qwen_image_vae.safetensors (VAE)
+ * - qwen-image-edit-2511-multiple-angles-lora.safetensors (LoRA)
+ * - Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors (LoRA)
+ *
+ * Required custom nodes:
+ * - ComfyUI-qwenmultiangle (jtydhr88/ComfyUI-qwenmultiangle)
+ * - FluxKontextImageScale (comfy-core)
+ * - CFGNorm, ModelSamplingAuraFlow (comfy-core)
+ * - FluxKontextMultiReferenceLatentMethod (comfy-core)
  */
 
-import { ImageSize, ComfyUIModelPreset } from '../types';
+import { ImageSize } from '../types';
 
 // ═══════════════════════════════════════════════════════
 // CONNECTION
@@ -25,24 +38,6 @@ export const isComfyUIAvailable = async (): Promise<boolean> => {
     const r = await fetch(`${comfyuiUrl}/system_stats`, { signal: AbortSignal.timeout(3000) });
     return r.ok;
   } catch { return false; }
-};
-
-export const getAvailableModels = async (): Promise<string[]> => {
-  try {
-    const r = await fetch(`${comfyuiUrl}/object_info/CheckpointLoaderSimple`);
-    if (!r.ok) return [];
-    const d = await r.json();
-    return d?.CheckpointLoaderSimple?.input?.required?.ckpt_name?.[0] || [];
-  } catch { return []; }
-};
-
-export const getAvailableLoRAs = async (): Promise<string[]> => {
-  try {
-    const r = await fetch(`${comfyuiUrl}/object_info/LoraLoader`);
-    if (!r.ok) return [];
-    const d = await r.json();
-    return d?.LoraLoader?.input?.required?.lora_name?.[0] || [];
-  } catch { return []; }
 };
 
 // ═══════════════════════════════════════════════════════
@@ -64,47 +59,54 @@ export const uploadImageToComfyUI = async (base64Image: string, filename: string
   return (await r.json()).name;
 };
 
-const fetchGeneratedImage = async (promptId: string): Promise<string> => {
+const fetchAllGeneratedImages = async (promptId: string): Promise<string[]> => {
   const r = await fetch(`${comfyuiUrl}/history/${promptId}`);
   if (!r.ok) throw new Error('Failed to fetch ComfyUI history');
   const data = await r.json();
   const outputs = data[promptId]?.outputs;
   if (!outputs) throw new Error('No outputs in ComfyUI history');
 
-  for (const nodeId of Object.keys(outputs)) {
+  const images: string[] = [];
+
+  // Collect images from all SaveImage nodes, in order of node ID
+  const sortedNodeIds = Object.keys(outputs).sort();
+  for (const nodeId of sortedNodeIds) {
     const nodeOutput = outputs[nodeId];
     if (nodeOutput.images?.length > 0) {
-      const img = nodeOutput.images[0];
-      const imgR = await fetch(
-        `${comfyuiUrl}/view?filename=${encodeURIComponent(img.filename)}&subfolder=${encodeURIComponent(img.subfolder || '')}&type=${img.type || 'output'}`
-      );
-      if (!imgR.ok) throw new Error('Failed to fetch image from ComfyUI');
-      const blob = await imgR.blob();
-      return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(reader.result as string);
-        reader.onerror = () => reject(new Error('Failed to read image'));
-        reader.readAsDataURL(blob);
-      });
+      for (const img of nodeOutput.images) {
+        const imgR = await fetch(
+          `${comfyuiUrl}/view?filename=${encodeURIComponent(img.filename)}&subfolder=${encodeURIComponent(img.subfolder || '')}&type=${img.type || 'output'}`
+        );
+        if (!imgR.ok) continue;
+        const blob = await imgR.blob();
+        const base64 = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result as string);
+          reader.onerror = () => reject(new Error('Failed to read image'));
+          reader.readAsDataURL(blob);
+        });
+        images.push(base64);
+      }
     }
   }
-  throw new Error('No image found in ComfyUI output');
+
+  return images;
 };
 
 // ═══════════════════════════════════════════════════════
 // QUEUE & WAIT
 // ═══════════════════════════════════════════════════════
 
-export const queueAndWaitForImage = async (
+const queueAndWait = async (
   workflow: Record<string, any>,
   onProgress?: (value: number, max: number) => void
-): Promise<string> => {
+): Promise<string[]> => {
   const clientId = crypto.randomUUID();
   const ws = new WebSocket(`ws://${new URL(comfyuiUrl).host}/ws?clientId=${clientId}`);
 
   return new Promise((resolve, reject) => {
     let promptId = '';
-    const timeoutId = setTimeout(() => { ws.close(); reject(new Error('ComfyUI timeout (5 min)')); }, 300000);
+    const timeoutId = setTimeout(() => { ws.close(); reject(new Error('ComfyUI timeout (10 min)')); }, 600000);
 
     ws.onmessage = async (event) => {
       try {
@@ -114,7 +116,7 @@ export const queueAndWaitForImage = async (
         }
         if (msg.type === 'executing' && msg.data?.prompt_id === promptId && msg.data?.node === null) {
           clearTimeout(timeoutId); ws.close();
-          try { resolve(await fetchGeneratedImage(promptId)); }
+          try { resolve(await fetchAllGeneratedImages(promptId)); }
           catch (err) { reject(err); }
         }
       } catch { /* ignore non-JSON */ }
@@ -137,356 +139,471 @@ export const queueAndWaitForImage = async (
 };
 
 // ═══════════════════════════════════════════════════════
-// MODEL PRESET CONFIGS
+// STITCH IMAGES INTO A SINGLE 3-VIEW IMAGE
 // ═══════════════════════════════════════════════════════
 
-export interface ModelPresetInfo {
-  id: ComfyUIModelPreset;
-  name: string;
-  description: string;
-  requiredModels: { name: string; path: string; url: string }[];
-  requiredNodes: { name: string; repo: string }[];
+/**
+ * Takes 3 individual view images and stitches them side by side into one wide image.
+ */
+const stitchImages = async (images: string[]): Promise<string> => {
+  // Load all images
+  const loadImage = (src: string): Promise<HTMLImageElement> => {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error('Failed to load image for stitching'));
+      img.src = src;
+    });
+  };
+
+  const imgs = await Promise.all(images.map(loadImage));
+
+  // Calculate canvas dimensions
+  const maxHeight = Math.max(...imgs.map(i => i.height));
+  const totalWidth = imgs.reduce((sum, i) => sum + i.width, 0);
+
+  const canvas = document.createElement('canvas');
+  canvas.width = totalWidth;
+  canvas.height = maxHeight;
+  const ctx = canvas.getContext('2d')!;
+
+  // White background
+  ctx.fillStyle = '#FFFFFF';
+  ctx.fillRect(0, 0, totalWidth, maxHeight);
+
+  // Draw each image side by side
+  let x = 0;
+  for (const img of imgs) {
+    // Center vertically
+    const y = (maxHeight - img.height) / 2;
+    ctx.drawImage(img, x, y);
+    x += img.width;
+  }
+
+  // Draw thin gray dividers
+  ctx.strokeStyle = '#E0E0E0';
+  ctx.lineWidth = 2;
+  let divX = imgs[0].width;
+  for (let i = 1; i < imgs.length; i++) {
+    ctx.beginPath();
+    ctx.moveTo(divX, 0);
+    ctx.lineTo(divX, maxHeight);
+    ctx.stroke();
+    divX += imgs[i].width;
+  }
+
+  return canvas.toDataURL('image/png');
+};
+
+// ═══════════════════════════════════════════════════════
+// WORKFLOW BUILDER — QWEN MULTIANGLE
+// ═══════════════════════════════════════════════════════
+
+interface ViewConfig {
+  horizontal_angle: number;
+  vertical_angle: number;
+  zoom: number;
 }
 
-export const MODEL_PRESETS: ModelPresetInfo[] = [
-  {
-    id: 'flux2-multiangle',
-    name: 'Flux 2 + Multi-Angles LoRA',
-    description: 'Meilleure qualité photoréaliste. Génère les 3 vues via un LoRA entraîné spécifiquement sur les planches multi-angles.',
-    requiredModels: [
-      { name: 'flux1-dev-fp8.safetensors', path: 'models/checkpoints/', url: 'https://huggingface.co/Comfy-Org/flux1-dev/blob/main/flux1-dev-fp8.safetensors' },
-      { name: 'Flux-2-Multi-Angles-LoRA-v2.safetensors', path: 'models/loras/', url: 'https://huggingface.co/lovis93/Flux-2-Multi-Angles-LoRA-v2' },
-    ],
-    requiredNodes: [],
-  },
-  {
-    id: 'sd3-mvadapter',
-    name: 'SDXL + MV-Adapter',
-    description: 'Multi-view dédié. Génère front/right/back avec cohérence structurelle garantie par MV-Adapter.',
-    requiredModels: [
-      { name: 'sd_xl_base_1.0.safetensors', path: 'models/checkpoints/', url: 'https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0' },
-    ],
-    requiredNodes: [
-      { name: 'ComfyUI-MVAdapter', repo: 'https://github.com/huanngzh/ComfyUI-MVAdapter' },
-    ],
-  },
-  {
-    id: 'qwen-image-edit',
-    name: 'Qwen-Image-Edit',
-    description: 'Édition guidée par référence. Idéal en pass 2 haute cohérence : prend une image de référence et génère les vues en conservant le design exact.',
-    requiredModels: [
-      { name: 'Qwen-Image-Edit (auto-download)', path: 'models/', url: 'https://huggingface.co/Qwen/Qwen-Image-Edit-2511' },
-    ],
-    requiredNodes: [
-      { name: 'Comfyui-QwenEditUtils ou support natif', repo: 'https://github.com/lrzjason/Comfyui-QwenEditUtils' },
-    ],
-  },
+/**
+ * Builds one "view generation chain" for the Qwen Multiangle workflow.
+ * Each view needs: QwenMultiangleCameraNode → TextEncodeQwenImageEditPlus (neg)
+ *   → FluxKontextMultiReferenceLatentMethod (neg) → TextEncodeQwenImageEditPlus (pos)
+ *   → FluxKontextMultiReferenceLatentMethod (pos) → ModelSamplingAuraFlow → CFGNorm
+ *   → VAEEncode → KSampler → VAEDecode → SaveImage
+ */
+const buildViewChain = (
+  viewIndex: number,
+  view: ViewConfig,
+  imageNodeId: string,
+  seed: number,
+  prefix: string
+): Record<string, any> => {
+  // Use unique prefixes per view to avoid node ID collisions
+  const p = `v${viewIndex}`;
+
+  return {
+    // Camera angle → generates the prompt string
+    [`${p}_cam`]: {
+      inputs: {
+        horizontal_angle: view.horizontal_angle,
+        vertical_angle: view.vertical_angle,
+        zoom: view.zoom,
+        default_prompts: false,
+        camera_view: false,
+        image: [imageNodeId, 0],
+      },
+      class_type: 'QwenMultiangleCameraNode',
+      _meta: { title: `Camera View ${viewIndex}` },
+    },
+    // Scale image
+    [`${p}_scale`]: {
+      inputs: { image: [imageNodeId, 0] },
+      class_type: 'FluxKontextImageScale',
+      _meta: { title: `Scale ${viewIndex}` },
+    },
+    // ModelSamplingAuraFlow
+    [`${p}_aura`]: {
+      inputs: { shift: 3.1, model: ['shared_lora2', 0] },
+      class_type: 'ModelSamplingAuraFlow',
+      _meta: { title: `AuraFlow ${viewIndex}` },
+    },
+    // CFGNorm
+    [`${p}_cfgnorm`]: {
+      inputs: { strength: 1, model: [`${p}_aura`, 0] },
+      class_type: 'CFGNorm',
+      _meta: { title: `CFGNorm ${viewIndex}` },
+    },
+    // Negative conditioning (empty prompt)
+    [`${p}_neg_encode`]: {
+      inputs: {
+        prompt: '',
+        speak_and_recognation: { __value__: [false, true] },
+        clip: ['shared_clip', 0],
+        vae: ['shared_vae', 0],
+        image1: [`${p}_scale`, 0],
+      },
+      class_type: 'TextEncodeQwenImageEditPlus',
+      _meta: { title: `Neg Encode ${viewIndex}` },
+    },
+    [`${p}_neg_ref`]: {
+      inputs: {
+        reference_latents_method: 'index_timestep_zero',
+        conditioning: [`${p}_neg_encode`, 0],
+      },
+      class_type: 'FluxKontextMultiReferenceLatentMethod',
+      _meta: { title: `Neg Ref ${viewIndex}` },
+    },
+    // Positive conditioning (camera prompt)
+    [`${p}_pos_encode`]: {
+      inputs: {
+        prompt: [`${p}_cam`, 0],
+        speak_and_recognation: { __value__: [false, true] },
+        clip: ['shared_clip', 0],
+        vae: ['shared_vae', 0],
+        image1: [`${p}_scale`, 0],
+      },
+      class_type: 'TextEncodeQwenImageEditPlus',
+      _meta: { title: `Pos Encode ${viewIndex}` },
+    },
+    [`${p}_pos_ref`]: {
+      inputs: {
+        reference_latents_method: 'index_timestep_zero',
+        conditioning: [`${p}_pos_encode`, 0],
+      },
+      class_type: 'FluxKontextMultiReferenceLatentMethod',
+      _meta: { title: `Pos Ref ${viewIndex}` },
+    },
+    // VAE Encode reference image
+    [`${p}_vae_enc`]: {
+      inputs: {
+        pixels: [`${p}_scale`, 0],
+        vae: ['shared_vae', 0],
+      },
+      class_type: 'VAEEncode',
+      _meta: { title: `VAE Encode ${viewIndex}` },
+    },
+    // KSampler
+    [`${p}_sampler`]: {
+      inputs: {
+        seed: seed + viewIndex,
+        steps: 4,
+        cfg: 1,
+        sampler_name: 'euler',
+        scheduler: 'simple',
+        denoise: 1,
+        model: [`${p}_cfgnorm`, 0],
+        positive: [`${p}_pos_ref`, 0],
+        negative: [`${p}_neg_ref`, 0],
+        latent_image: [`${p}_vae_enc`, 0],
+      },
+      class_type: 'KSampler',
+      _meta: { title: `KSampler ${viewIndex}` },
+    },
+    // VAE Decode
+    [`${p}_decode`]: {
+      inputs: {
+        samples: [`${p}_sampler`, 0],
+        vae: ['shared_vae', 0],
+      },
+      class_type: 'VAEDecode',
+      _meta: { title: `VAE Decode ${viewIndex}` },
+    },
+    // Save Image
+    [`${p}_save`]: {
+      inputs: {
+        filename_prefix: `${prefix}/${viewIndex}`,
+        images: [`${p}_decode`, 0],
+      },
+      class_type: 'SaveImage',
+      _meta: { title: `Save ${viewIndex}` },
+    },
+  };
+};
+
+/**
+ * Builds a complete Qwen Multiangle workflow for 3 views.
+ */
+const buildQwenMultiangleWorkflow = (
+  referenceImageFilename: string,
+  views: ViewConfig[],
+  seed?: number
+): Record<string, any> => {
+  const s = seed ?? Math.floor(Math.random() * 9999999999999);
+  const prefix = `ObjGen_${Date.now()}`;
+
+  // Shared nodes (loaded once, used by all views)
+  const workflow: Record<string, any> = {
+    // Load reference image
+    'shared_image': {
+      inputs: { image: referenceImageFilename },
+      class_type: 'LoadImage',
+      _meta: { title: 'Load Reference Image' },
+    },
+    // CLIP
+    'shared_clip': {
+      inputs: {
+        clip_name: 'qwen_2.5_vl_7b_fp8_scaled.safetensors',
+        type: 'qwen_image',
+        device: 'default',
+      },
+      class_type: 'CLIPLoader',
+      _meta: { title: 'Load CLIP' },
+    },
+    // VAE
+    'shared_vae': {
+      inputs: { vae_name: 'qwen_image_vae.safetensors' },
+      class_type: 'VAELoader',
+      _meta: { title: 'Load VAE' },
+    },
+    // UNET
+    'shared_unet': {
+      inputs: {
+        unet_name: 'Qwen-Image-Edit-2511-FP8_e4m3fn.safetensors',
+        weight_dtype: 'default',
+      },
+      class_type: 'UNETLoader',
+      _meta: { title: 'Load Diffusion Model' },
+    },
+    // LoRA 1: Lightning 4-steps
+    'shared_lora1': {
+      inputs: {
+        lora_name: 'Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors',
+        strength_model: 1,
+        model: ['shared_unet', 0],
+      },
+      class_type: 'LoraLoaderModelOnly',
+      _meta: { title: 'Load Lightning LoRA' },
+    },
+    // LoRA 2: Multiple Angles
+    'shared_lora2': {
+      inputs: {
+        lora_name: 'qwen-image-edit-2511-multiple-angles-lora.safetensors',
+        strength_model: 1,
+        model: ['shared_lora1', 0],
+      },
+      class_type: 'LoraLoaderModelOnly',
+      _meta: { title: 'Load Multi-Angles LoRA' },
+    },
+  };
+
+  // Add view chains
+  for (let i = 0; i < views.length; i++) {
+    const chain = buildViewChain(i, views[i], 'shared_image', s, prefix);
+    Object.assign(workflow, chain);
+  }
+
+  return workflow;
+};
+
+// ═══════════════════════════════════════════════════════
+// VIEW PRESETS — 6 CUSTOM VIEWS
+// ═══════════════════════════════════════════════════════
+
+/** 6 views organized as 2 sets of 3 for the PDF slides */
+export const VIEWS_6_CUSTOM: ViewConfig[] = [
+  // Slide 1 — 3 views
+  { horizontal_angle: 37, vertical_angle: 37, zoom: 5 },    // Vue 1: 3/4 avant haut
+  { horizontal_angle: 37, vertical_angle: -22, zoom: 5 },   // Vue 2: 3/4 avant bas
+  { horizontal_angle: 217, vertical_angle: 37, zoom: 5 },   // Vue 3: 3/4 arrière haut
+  // Slide 2 — 3 views
+  { horizontal_angle: 217, vertical_angle: -22, zoom: 5 },  // Vue 4: 3/4 arrière bas
+  { horizontal_angle: 90, vertical_angle: 8, zoom: 5 },     // Vue 5: Profil
+  { horizontal_angle: 0, vertical_angle: 67, zoom: 5 },     // Vue 6: Dessus incliné
+];
+
+/** Labels for each view (used in PDF) */
+export const VIEW_LABELS: string[] = [
+  '3/4 AVANT HAUT',
+  '3/4 AVANT BAS',
+  '3/4 ARRIÈRE HAUT',
+  '3/4 ARRIÈRE BAS',
+  'PROFIL',
+  'DESSUS',
 ];
 
 // ═══════════════════════════════════════════════════════
-// WORKFLOW BUILDERS PER PRESET
-// ═══════════════════════════════════════════════════════
-
-const NEG_PROMPT = 'blurry, low quality, distorted, deformed, ugly, watermark, text, logo, labels, annotations, different objects between views, inconsistent, extra legs, missing parts';
-
-/**
- * Resolution mapping for 16:9 output.
- */
-const getResolution = (imageSize: ImageSize): { width: number; height: number } => {
-  const map: Record<ImageSize, { width: number; height: number }> = {
-    '512px': { width: 912, height: 512 },
-    '1K': { width: 1344, height: 768 },
-    '2K': { width: 1920, height: 1080 },
-    '4K': { width: 2560, height: 1440 },
-  };
-  return map[imageSize] || map['1K'];
-};
-
-/**
- * Flux 2 + Multi-Angles LoRA workflow.
- */
-const buildFlux2Workflow = (prompt: string, imageSize: ImageSize): Record<string, any> => {
-  const res = getResolution(imageSize);
-  const seed = Math.floor(Math.random() * 2147483647);
-
-  const turnaroundPrompt = `multi-angle product turnaround sheet, three views side by side: front view, right side view, rear view. ${prompt}. Pure white background, soft studio lighting, photorealistic, 8K, sharp focus, professional catalog. Identical object in all views, consistent proportions, same materials and colors.`;
-
-  return {
-    '1': {
-      class_type: 'CheckpointLoaderSimple',
-      inputs: { ckpt_name: 'flux1-dev-fp8.safetensors' },
-    },
-    '10': {
-      class_type: 'LoraLoader',
-      inputs: {
-        lora_name: 'Flux-2-Multi-Angles-LoRA-v2.safetensors',
-        strength_model: 0.85,
-        strength_clip: 0.85,
-        model: ['1', 0],
-        clip: ['1', 1],
-      },
-    },
-    '2': {
-      class_type: 'CLIPTextEncode',
-      inputs: { text: turnaroundPrompt, clip: ['10', 1] },
-    },
-    '3': {
-      class_type: 'CLIPTextEncode',
-      inputs: { text: NEG_PROMPT, clip: ['10', 1] },
-    },
-    '4': {
-      class_type: 'EmptyLatentImage',
-      inputs: { width: res.width, height: res.height, batch_size: 1 },
-    },
-    '5': {
-      class_type: 'KSampler',
-      inputs: {
-        seed, steps: 28, cfg: 3.5, sampler_name: 'euler', scheduler: 'normal', denoise: 1,
-        model: ['10', 0], positive: ['2', 0], negative: ['3', 0], latent_image: ['4', 0],
-      },
-    },
-    '6': {
-      class_type: 'VAEDecode',
-      inputs: { samples: ['5', 0], vae: ['1', 2] },
-    },
-    '7': {
-      class_type: 'SaveImage',
-      inputs: { filename_prefix: 'ObjGen_Flux', images: ['6', 0] },
-    },
-  };
-};
-
-/**
- * SDXL + MV-Adapter workflow.
- * Uses the MVAdapter custom nodes to generate 3 consistent views.
- */
-const buildMVAdapterWorkflow = (prompt: string, imageSize: ImageSize): Record<string, any> => {
-  const res = getResolution(imageSize);
-  const seed = Math.floor(Math.random() * 2147483647);
-
-  // MV-Adapter uses specific node types from ComfyUI-MVAdapter
-  // This is the text-to-multiview (t2mv) workflow structure
-  return {
-    '1': {
-      class_type: 'CheckpointLoaderSimple',
-      inputs: { ckpt_name: 'sd_xl_base_1.0.safetensors' },
-    },
-    '20': {
-      class_type: 'MVAdapterModelMakeup',
-      inputs: {
-        mv_adapter_name: 'mvadapter_sdxl_ldm.safetensors',
-        num_views: 3,
-        model: ['1', 0],
-      },
-    },
-    '21': {
-      class_type: 'MVAdapterSchedulerMakeup',
-      inputs: {
-        guidance_scale: 7.0,
-        num_views: 3,
-        view_ids: '0,4,2', // front, right, back
-        model: ['20', 0],
-      },
-    },
-    '2': {
-      class_type: 'CLIPTextEncode',
-      inputs: { text: `${prompt}. Photorealistic product visualization, 8K, white background, studio lighting.`, clip: ['1', 1] },
-    },
-    '3': {
-      class_type: 'CLIPTextEncode',
-      inputs: { text: NEG_PROMPT, clip: ['1', 1] },
-    },
-    '4': {
-      class_type: 'EmptyLatentImage',
-      inputs: { width: res.width, height: Math.round(res.height / 3), batch_size: 3 },
-    },
-    '5': {
-      class_type: 'KSampler',
-      inputs: {
-        seed, steps: 30, cfg: 7, sampler_name: 'euler', scheduler: 'normal', denoise: 1,
-        model: ['21', 0], positive: ['2', 0], negative: ['3', 0], latent_image: ['4', 0],
-      },
-    },
-    '6': {
-      class_type: 'VAEDecode',
-      inputs: { samples: ['5', 0], vae: ['1', 2] },
-    },
-    // Stitch the 3 views horizontally
-    '25': {
-      class_type: 'ImageBatch',
-      inputs: { images: ['6', 0] },
-    },
-    '7': {
-      class_type: 'SaveImage',
-      inputs: { filename_prefix: 'ObjGen_MVAdapter', images: ['6', 0] },
-    },
-  };
-};
-
-/**
- * Qwen-Image-Edit workflow (for high-coherence pass 2).
- * Takes a reference image and an editing instruction to produce the 3-view turnaround.
- */
-const buildQwenEditWorkflow = (referenceFilename: string, prompt: string, imageSize: ImageSize): Record<string, any> => {
-  const res = getResolution(imageSize);
-
-  const editInstruction = `Transform this single product image into a technical reference sheet showing the EXACT SAME object from 3 angles side by side in one horizontal image: front view (left), right side view (center), rear view (right). Keep every detail identical: same shape, same materials, same colors, same number of legs/handles/drawers. Pure white background, photorealistic rendering, professional catalog quality.`;
-
-  return {
-    '1': {
-      class_type: 'LoadImage',
-      inputs: { image: referenceFilename },
-    },
-    '2': {
-      class_type: 'QwenImageEdit',
-      inputs: {
-        image: ['1', 0],
-        instruction: editInstruction,
-        width: res.width,
-        height: res.height,
-        steps: 30,
-        seed: Math.floor(Math.random() * 2147483647),
-      },
-    },
-    '7': {
-      class_type: 'SaveImage',
-      inputs: { filename_prefix: 'ObjGen_QwenEdit', images: ['2', 0] },
-    },
-  };
-};
-
-/**
- * Build a reference image workflow (for high-coherence pass 1, any preset).
- */
-const buildReferenceWorkflow = (prompt: string, preset: ComfyUIModelPreset): Record<string, any> => {
-  const refPrompt = `Single photorealistic product photograph, front 3/4 view slightly angled 30 degrees. ${prompt}. Pure white background, soft studio lighting, 8K, sharp focus. Show every structural detail: legs, handles, drawers, cushions, edges, hardware. 100% original design.`;
-
-  if (preset === 'flux2-multiangle') {
-    return {
-      '1': { class_type: 'CheckpointLoaderSimple', inputs: { ckpt_name: 'flux1-dev-fp8.safetensors' } },
-      '2': { class_type: 'CLIPTextEncode', inputs: { text: refPrompt, clip: ['1', 1] } },
-      '3': { class_type: 'CLIPTextEncode', inputs: { text: NEG_PROMPT, clip: ['1', 1] } },
-      '4': { class_type: 'EmptyLatentImage', inputs: { width: 1024, height: 1024, batch_size: 1 } },
-      '5': { class_type: 'KSampler', inputs: {
-        seed: Math.floor(Math.random() * 2147483647), steps: 28, cfg: 3.5,
-        sampler_name: 'euler', scheduler: 'normal', denoise: 1,
-        model: ['1', 0], positive: ['2', 0], negative: ['3', 0], latent_image: ['4', 0],
-      }},
-      '6': { class_type: 'VAEDecode', inputs: { samples: ['5', 0], vae: ['1', 2] } },
-      '7': { class_type: 'SaveImage', inputs: { filename_prefix: 'ObjGen_Ref', images: ['6', 0] } },
-    };
-  }
-
-  // Default: SDXL base for reference
-  return {
-    '1': { class_type: 'CheckpointLoaderSimple', inputs: { ckpt_name: 'sd_xl_base_1.0.safetensors' } },
-    '2': { class_type: 'CLIPTextEncode', inputs: { text: refPrompt, clip: ['1', 1] } },
-    '3': { class_type: 'CLIPTextEncode', inputs: { text: NEG_PROMPT, clip: ['1', 1] } },
-    '4': { class_type: 'EmptyLatentImage', inputs: { width: 1024, height: 1024, batch_size: 1 } },
-    '5': { class_type: 'KSampler', inputs: {
-      seed: Math.floor(Math.random() * 2147483647), steps: 25, cfg: 7,
-      sampler_name: 'euler', scheduler: 'normal', denoise: 1,
-      model: ['1', 0], positive: ['2', 0], negative: ['3', 0], latent_image: ['4', 0],
-    }},
-    '6': { class_type: 'VAEDecode', inputs: { samples: ['5', 0], vae: ['1', 2] } },
-    '7': { class_type: 'SaveImage', inputs: { filename_prefix: 'ObjGen_Ref', images: ['6', 0] } },
-  };
-};
-
-// ═══════════════════════════════════════════════════════
-// HIGH-LEVEL GENERATION
+// REFERENCE IMAGE GENERATION VIA QWEN (LOCAL, 0€)
 // ═══════════════════════════════════════════════════════
 
 /**
- * Generates a 3-view image using ComfyUI with the selected preset.
- * Supports standard and high-coherence modes.
+ * Builds a Qwen workflow to generate a reference image from a text prompt.
+ * Uses Qwen-Image-Edit with a blank/simple starting image and a text description.
+ * This is a basic text-to-image through the edit model.
+ */
+const buildQwenReferenceWorkflow = (
+  textPrompt: string,
+  seed?: number
+): Record<string, any> => {
+  const s = seed ?? Math.floor(Math.random() * 9999999999999);
+
+  return {
+    // Shared models
+    'shared_clip': {
+      inputs: { clip_name: 'qwen_2.5_vl_7b_fp8_scaled.safetensors', type: 'qwen_image', device: 'default' },
+      class_type: 'CLIPLoader', _meta: { title: 'Load CLIP' },
+    },
+    'shared_vae': {
+      inputs: { vae_name: 'qwen_image_vae.safetensors' },
+      class_type: 'VAELoader', _meta: { title: 'Load VAE' },
+    },
+    'shared_unet': {
+      inputs: { unet_name: 'Qwen-Image-Edit-2511-FP8_e4m3fn.safetensors', weight_dtype: 'default' },
+      class_type: 'UNETLoader', _meta: { title: 'Load Diffusion Model' },
+    },
+    'shared_lora1': {
+      inputs: { lora_name: 'Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors', strength_model: 1, model: ['shared_unet', 0] },
+      class_type: 'LoraLoaderModelOnly', _meta: { title: 'Load Lightning LoRA' },
+    },
+    // Empty latent (no reference image — pure generation)
+    'empty_latent': {
+      inputs: { width: 1024, height: 1024, batch_size: 1 },
+      class_type: 'EmptyLatentImage', _meta: { title: 'Empty Latent' },
+    },
+    // ModelSamplingAuraFlow
+    'aura': {
+      inputs: { shift: 3.1, model: ['shared_lora1', 0] },
+      class_type: 'ModelSamplingAuraFlow', _meta: { title: 'AuraFlow' },
+    },
+    'cfgnorm': {
+      inputs: { strength: 1, model: ['aura', 0] },
+      class_type: 'CFGNorm', _meta: { title: 'CFGNorm' },
+    },
+    // Positive prompt
+    'pos_encode': {
+      inputs: {
+        prompt: `Generate a single photorealistic product photograph. ${textPrompt}. Front 3/4 view, slightly angled 30 degrees. Pure white background, soft studio lighting, 8K, sharp focus. Show every structural detail clearly. 100% original design.`,
+        speak_and_recognation: { __value__: [false, true] },
+        clip: ['shared_clip', 0],
+        vae: ['shared_vae', 0],
+      },
+      class_type: 'TextEncodeQwenImageEditPlus', _meta: { title: 'Positive Prompt' },
+    },
+    'pos_ref': {
+      inputs: { reference_latents_method: 'index_timestep_zero', conditioning: ['pos_encode', 0] },
+      class_type: 'FluxKontextMultiReferenceLatentMethod', _meta: { title: 'Pos Ref' },
+    },
+    // Negative prompt
+    'neg_encode': {
+      inputs: {
+        prompt: 'blurry, low quality, distorted, deformed, ugly, watermark, text, logo',
+        speak_and_recognation: { __value__: [false, true] },
+        clip: ['shared_clip', 0],
+        vae: ['shared_vae', 0],
+      },
+      class_type: 'TextEncodeQwenImageEditPlus', _meta: { title: 'Negative Prompt' },
+    },
+    'neg_ref': {
+      inputs: { reference_latents_method: 'index_timestep_zero', conditioning: ['neg_encode', 0] },
+      class_type: 'FluxKontextMultiReferenceLatentMethod', _meta: { title: 'Neg Ref' },
+    },
+    // KSampler
+    'sampler': {
+      inputs: {
+        seed: s, steps: 4, cfg: 1, sampler_name: 'euler', scheduler: 'simple', denoise: 1,
+        model: ['cfgnorm', 0], positive: ['pos_ref', 0], negative: ['neg_ref', 0], latent_image: ['empty_latent', 0],
+      },
+      class_type: 'KSampler', _meta: { title: 'KSampler' },
+    },
+    // VAE Decode
+    'decode': {
+      inputs: { samples: ['sampler', 0], vae: ['shared_vae', 0] },
+      class_type: 'VAEDecode', _meta: { title: 'VAE Decode' },
+    },
+    // Save
+    'save': {
+      inputs: { filename_prefix: 'ObjGen_Ref', images: ['decode', 0] },
+      class_type: 'SaveImage', _meta: { title: 'Save Reference' },
+    },
+  };
+};
+
+/**
+ * Generates a reference image entirely locally using Qwen (0€ cost).
+ */
+export const generateReferenceWithQwen = async (
+  prompt: string,
+  onProgress?: (value: number, max: number) => void
+): Promise<string> => {
+  const workflow = buildQwenReferenceWorkflow(prompt);
+  const images = await queueAndWait(workflow, onProgress);
+  if (images.length === 0) throw new Error('Qwen reference generation returned no image');
+  return images[0];
+};
+
+// ═══════════════════════════════════════════════════════
+// HIGH-LEVEL GENERATION — 6 VIEWS
+// ═══════════════════════════════════════════════════════
+
+export interface ComfyUIResult {
+  /** Stitched image of views 1-3 (slide 1) */
+  slide1: string;
+  /** Stitched image of views 4-6 (slide 2) */
+  slide2: string;
+  /** All 6 individual view images */
+  individualViews: string[];
+}
+
+/**
+ * Generates 6 views using ComfyUI with the Qwen Multiangle workflow.
+ *
+ * Returns 2 stitched images (3 views each) for the 2 PDF slides,
+ * plus all 6 individual images.
+ *
+ * @param referenceImage - Base64 data URL of the reference image
+ * @param prompt - Object description (for naming)
+ * @param onProgress - Progress callback
  */
 export const generateWithComfyUI = async (
+  referenceImage: string,
   prompt: string,
-  imageSize: ImageSize = '1K',
-  preset: ComfyUIModelPreset = 'flux2-multiangle',
-  highCoherence: boolean = false,
   onProgress?: (step: string, value: number, max: number) => void
-): Promise<string> => {
+): Promise<ComfyUIResult> => {
+  // Upload reference image to ComfyUI
+  onProgress?.('Upload de la référence...', 0, 100);
+  const safeName = prompt.replace(/[^a-z0-9]/gi, '_').substring(0, 30);
+  const filename = await uploadImageToComfyUI(referenceImage, `ref_${safeName}_${Date.now()}.png`);
 
-  if (!highCoherence) {
-    // ── Standard mode: single-pass ──
-    let workflow: Record<string, any>;
+  // Build and queue the 6-view workflow
+  onProgress?.('Génération des 6 vues (Qwen)...', 0, 100);
+  const workflow = buildQwenMultiangleWorkflow(filename, VIEWS_6_CUSTOM);
 
-    switch (preset) {
-      case 'flux2-multiangle':
-        workflow = buildFlux2Workflow(prompt, imageSize);
-        break;
-      case 'sd3-mvadapter':
-        workflow = buildMVAdapterWorkflow(prompt, imageSize);
-        break;
-      case 'qwen-image-edit':
-        // Qwen needs a reference — fall back to Flux for standard mode
-        workflow = buildFlux2Workflow(prompt, imageSize);
-        break;
-      default:
-        workflow = buildFlux2Workflow(prompt, imageSize);
-    }
+  const images = await queueAndWait(workflow, (value, max) => {
+    onProgress?.('Génération des 6 vues (Qwen)...', value, max);
+  });
 
-    onProgress?.('Génération locale...', 0, 100);
-    return await queueAndWaitForImage(workflow, (v, m) => onProgress?.('Génération locale...', v, m));
+  if (images.length < 6) {
+    throw new Error(`ComfyUI returned only ${images.length} images instead of 6`);
   }
 
-  // ── High Coherence: 2-pass ──
+  // Stitch into 2 sets of 3
+  onProgress?.('Assemblage des vues...', 90, 100);
+  const slide1 = await stitchImages(images.slice(0, 3));
+  const slide2 = await stitchImages(images.slice(3, 6));
 
-  // Pass 1: Generate reference image
-  onProgress?.('Pass 1 — Référence...', 0, 100);
-  const refWorkflow = buildReferenceWorkflow(prompt, preset);
-  const refImage = await queueAndWaitForImage(refWorkflow, (v, m) => onProgress?.('Pass 1 — Référence...', v, m));
-
-  // Upload reference to ComfyUI
-  const refFilename = await uploadImageToComfyUI(refImage, `ref_${Date.now()}.png`);
-
-  // Pass 2: Generate 3-view from reference
-  onProgress?.('Pass 2 — 3 vues...', 0, 100);
-
-  let turnaroundWorkflow: Record<string, any>;
-
-  if (preset === 'qwen-image-edit') {
-    // Qwen excels at reference-based editing
-    turnaroundWorkflow = buildQwenEditWorkflow(refFilename, prompt, imageSize);
-  } else {
-    // For Flux/SDXL: img2img from the reference
-    const res = getResolution(imageSize);
-    const turnaroundPrompt = `multi-angle product turnaround sheet, three views side by side: front view, right side view, rear view. ${prompt}. Pure white background, photorealistic, 8K. Same identical object in all 3 views.`;
-
-    turnaroundWorkflow = {
-      '1': { class_type: 'CheckpointLoaderSimple', inputs: { ckpt_name: preset === 'flux2-multiangle' ? 'flux1-dev-fp8.safetensors' : 'sd_xl_base_1.0.safetensors' } },
-      '8': { class_type: 'LoadImage', inputs: { image: refFilename } },
-      '9': { class_type: 'VAEEncode', inputs: { pixels: ['8', 0], vae: ['1', 2] } },
-      '2': { class_type: 'CLIPTextEncode', inputs: { text: turnaroundPrompt, clip: ['1', 1] } },
-      '3': { class_type: 'CLIPTextEncode', inputs: { text: NEG_PROMPT, clip: ['1', 1] } },
-      '5': { class_type: 'KSampler', inputs: {
-        seed: Math.floor(Math.random() * 2147483647),
-        steps: preset === 'flux2-multiangle' ? 28 : 25,
-        cfg: preset === 'flux2-multiangle' ? 3.5 : 7,
-        sampler_name: 'euler', scheduler: 'normal', denoise: 0.75,
-        model: ['1', 0], positive: ['2', 0], negative: ['3', 0], latent_image: ['9', 0],
-      }},
-      '6': { class_type: 'VAEDecode', inputs: { samples: ['5', 0], vae: ['1', 2] } },
-      '7': { class_type: 'SaveImage', inputs: { filename_prefix: 'ObjGen_HC', images: ['6', 0] } },
-    };
-
-    // Add LoRA for Flux
-    if (preset === 'flux2-multiangle') {
-      turnaroundWorkflow['10'] = {
-        class_type: 'LoraLoader',
-        inputs: {
-          lora_name: 'Flux-2-Multi-Angles-LoRA-v2.safetensors',
-          strength_model: 0.85, strength_clip: 0.85,
-          model: ['1', 0], clip: ['1', 1],
-        },
-      };
-      turnaroundWorkflow['5'].inputs.model = ['10', 0];
-      turnaroundWorkflow['2'].inputs.clip = ['10', 1];
-      turnaroundWorkflow['3'].inputs.clip = ['10', 1];
-    }
-  }
-
-  return await queueAndWaitForImage(turnaroundWorkflow, (v, m) => onProgress?.('Pass 2 — 3 vues...', v, m));
+  return {
+    slide1,
+    slide2,
+    individualViews: images.slice(0, 6),
+  };
 };

@@ -30,6 +30,10 @@ export interface GeneratedImage {
   prompt: string;
   base64: string;
   resolution: ImageSize;
+  /** Second slide image (views 4-6) — only present for ComfyUI 6-view mode */
+  base64Slide2?: string;
+  /** All 6 individual view images — only present for ComfyUI 6-view mode */
+  individualViews?: string[];
 }
 
 export interface BatchJob {

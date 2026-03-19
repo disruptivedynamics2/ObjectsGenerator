@@ -9,7 +9,7 @@ import { authenticateGoogleDrive, isDriveAuthenticated, uploadBatchResultsToDriv
 import { verifyAllImages, filterConsistentImages, VerificationResult } from './services/viewVerificationService';
 import { backupBatchJob, restoreBatchJob, restoreBatchFromFile, hasBatchBackup, clearBatchBackup } from './services/batchPersistenceService';
 import { getBatchJobStatus, getBatchJobResults } from './services/batchService';
-import { generateWithComfyUI, isComfyUIAvailable, MODEL_PRESETS } from './services/comfyuiService';
+import { generateWithComfyUI, isComfyUIAvailable, generateReferenceWithQwen } from './services/comfyuiService';
 import { ApiKeySelector } from './components/ApiKeySelector';
 import { PromptGenerator } from './components/PromptGenerator';
 import { PromptGroup, GeneratedImage, AppState, ImageSize, ImageModel, GenerationMode, GenerationBackend, ComfyUIModelPreset, BatchJob, BatchJobState } from './types';
@@ -44,6 +44,7 @@ const App: React.FC = () => {
   const [backend, setBackend] = useState<GenerationBackend>('gemini');
   const [comfyPreset, setComfyPreset] = useState<ComfyUIModelPreset>('flux2-multiangle');
   const [comfyAvailable, setComfyAvailable] = useState<boolean | null>(null);
+  const [comfyRefSource, setComfyRefSource] = useState<'gemini' | 'qwen'>('qwen');
 
   const [generatedImages, setGeneratedImages] = useState<GeneratedImage[]>([]);
   const [allGeneratedImages, setAllGeneratedImages] = useState<GeneratedImage[]>([]);
@@ -107,11 +108,31 @@ const App: React.FC = () => {
   }, [backend]);
 
   // Unified image generation — picks Gemini or ComfyUI
-  const generateImage = async (prompt: string): Promise<string> => {
+  // Returns a GeneratedImage-compatible object with optional slide2 for 6-view mode
+  const generateImage = async (prompt: string): Promise<{ base64: string; base64Slide2?: string; individualViews?: string[] }> => {
     if (backend === 'comfyui') {
-      return await generateWithComfyUI(prompt, selectedResolution, comfyPreset, highCoherence);
+      // Step 1: Generate reference image (Gemini or Qwen local)
+      let refImage: string;
+      if (comfyRefSource === 'qwen') {
+        // 100% local, 0€
+        refImage = await generateReferenceWithQwen(prompt);
+      } else {
+        // Gemini for reference (1 API call)
+        refImage = await generateImageForPrompt(prompt, '1K', selectedModel, false);
+      }
+
+      // Step 2: Generate 6 views via ComfyUI
+      const result = await generateWithComfyUI(refImage, prompt);
+
+      return {
+        base64: result.slide1,
+        base64Slide2: result.slide2,
+        individualViews: result.individualViews,
+      };
     }
-    return await generateImageForPrompt(prompt, selectedResolution, selectedModel, highCoherence);
+    // Gemini standard
+    const base64 = await generateImageForPrompt(prompt, selectedResolution, selectedModel, highCoherence);
+    return { base64 };
   };
 
   // --- File handling (click + drag & drop) ---
@@ -187,13 +208,13 @@ const App: React.FC = () => {
         const item = group.items[i];
         setProgress({ current: i + 1, total, status: `Génération de "${item.name}"...` });
 
-        let base64 = '';
+        let result: { base64: string; base64Slide2?: string; individualViews?: string[] } | null = null;
         let attempts = 0;
         const maxAttempts = 3;
 
         while (attempts < maxAttempts) {
           try {
-            base64 = await generateImage(item.prompt);
+            result = await generateImage(item.prompt);
             break;
           } catch (err: any) {
             attempts++;
@@ -207,8 +228,13 @@ const App: React.FC = () => {
           }
         }
 
-        if (base64) {
-          const newImg = { groupId: group.id, itemId: i, prompt: item.prompt, base64, resolution: selectedResolution };
+        if (result?.base64) {
+          const newImg: GeneratedImage = {
+            groupId: group.id, itemId: i, prompt: item.prompt,
+            base64: result.base64, resolution: selectedResolution,
+            base64Slide2: result.base64Slide2,
+            individualViews: result.individualViews,
+          };
           images.push(newImg);
           setGeneratedImages(prev => [...prev, newImg]);
         }
@@ -255,13 +281,13 @@ const App: React.FC = () => {
           itemsProcessed++;
           setProgress({ current: itemsProcessed, total: totalItems, status: `Génération de "${item.name}"...`, groupName: group.name });
 
-          let base64 = '';
+          let result: { base64: string; base64Slide2?: string; individualViews?: string[] } | null = null;
           let attempts = 0;
           const maxAttempts = 3;
 
           while (attempts < maxAttempts) {
             try {
-              base64 = await generateImage(item.prompt);
+              result = await generateImage(item.prompt);
               break;
             } catch (err: any) {
               attempts++;
@@ -275,8 +301,13 @@ const App: React.FC = () => {
             }
           }
 
-          if (base64) {
-            const newImg = { groupId: group.id, itemId: i, prompt: item.prompt, base64, resolution: selectedResolution };
+          if (result?.base64) {
+            const newImg: GeneratedImage = {
+              groupId: group.id, itemId: i, prompt: item.prompt,
+              base64: result.base64, resolution: selectedResolution,
+              base64Slide2: result.base64Slide2,
+              individualViews: result.individualViews,
+            };
             allImages.push(newImg);
             setAllGeneratedImages(prev => [...prev, newImg]);
           }
@@ -940,9 +971,9 @@ const App: React.FC = () => {
                   </button>
                 </div>
 
-                {/* ComfyUI preset selector */}
+                {/* ComfyUI status */}
                 {backend === 'comfyui' && (
-                  <div className="mt-3 space-y-3">
+                  <div className="mt-3 space-y-2">
                     {comfyAvailable === false && (
                       <div className="bg-red-50 border border-red-200 rounded-lg p-3 flex items-center gap-2">
                         <AlertCircle className="w-4 h-4 text-red-500" />
@@ -950,25 +981,48 @@ const App: React.FC = () => {
                       </div>
                     )}
                     {comfyAvailable === true && (
-                      <div className="bg-green-50 border border-green-200 rounded-lg p-2 flex items-center gap-2">
-                        <CheckCircle2 className="w-4 h-4 text-green-500" />
-                        <span className="text-xs text-green-700">ComfyUI connecté</span>
+                      <>
+                        <div className="bg-green-50 border border-green-200 rounded-lg p-3 flex items-center gap-2">
+                          <CheckCircle2 className="w-4 h-4 text-green-500" />
+                          <div>
+                            <span className="text-sm font-bold text-green-700 block">ComfyUI connecté — Qwen Multiangle (6 vues)</span>
+                            <span className="text-[10px] text-green-600">Génère 6 vues par objet → 2 slides PDF de 3 vues chacun.</span>
+                          </div>
+                        </div>
+                        {/* Reference source selector */}
+                        <div className="grid grid-cols-2 gap-2">
+                          <button
+                            onClick={() => setComfyRefSource('qwen')}
+                            className={`p-3 rounded-lg border-2 text-left transition-all ${
+                              comfyRefSource === 'qwen' ? 'border-green-500 bg-green-50' : 'border-slate-100 hover:border-slate-200'
+                            }`}
+                          >
+                            <span className={`font-bold text-sm block ${comfyRefSource === 'qwen' ? 'text-green-800' : 'text-slate-700'}`}>
+                              Référence Qwen (local)
+                              <span className="ml-2 text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded-full">0€</span>
+                            </span>
+                            <span className="text-[10px] text-slate-500 block mt-1">100% local sur votre GPU. Aucun coût API.</span>
+                          </button>
+                          <button
+                            onClick={() => setComfyRefSource('gemini')}
+                            className={`p-3 rounded-lg border-2 text-left transition-all ${
+                              comfyRefSource === 'gemini' ? 'border-indigo-500 bg-indigo-50' : 'border-slate-100 hover:border-slate-200'
+                            }`}
+                          >
+                            <span className={`font-bold text-sm block ${comfyRefSource === 'gemini' ? 'text-indigo-800' : 'text-slate-700'}`}>
+                              Référence Gemini (cloud)
+                            </span>
+                            <span className="text-[10px] text-slate-500 block mt-1">1 appel API Gemini pour la référence. Meilleure qualité initiale.</span>
+                          </button>
+                        </div>
+                      </>
+                    )}
+                    {comfyAvailable === null && (
+                      <div className="bg-slate-50 border border-slate-200 rounded-lg p-2 flex items-center gap-2">
+                        <Loader2 className="w-4 h-4 text-slate-400 animate-spin" />
+                        <span className="text-xs text-slate-500">Vérification de la connexion ComfyUI...</span>
                       </div>
                     )}
-                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-                      {MODEL_PRESETS.map(p => (
-                        <button
-                          key={p.id}
-                          onClick={() => setComfyPreset(p.id)}
-                          className={`p-3 rounded-lg border-2 text-left transition-all ${
-                            comfyPreset === p.id ? 'border-orange-500 bg-orange-50' : 'border-slate-100 hover:border-slate-200'
-                          }`}
-                        >
-                          <span className={`font-bold text-sm block ${comfyPreset === p.id ? 'text-orange-800' : 'text-slate-700'}`}>{p.name}</span>
-                          <span className="text-[10px] text-slate-500 block mt-1">{p.description}</span>
-                        </button>
-                      ))}
-                    </div>
                   </div>
                 )}
               </div>
