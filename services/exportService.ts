@@ -125,10 +125,34 @@ const addSlideToDoc = (
     : item.name;
   doc.text(title, 10, 12);
 
-  // Image
+  // Image — calculate height dynamically to preserve aspect ratio
   const imgWidth = availableWidth;
-  const imgHeight = 120;
+  let imgHeight = 120; // default for 16:9 Gemini images
   try {
+    // Try to detect actual image dimensions from base64 to preserve ratio
+    const tempImg = new Image();
+    const imgLoadPromise = new Promise<void>((resolve) => {
+      tempImg.onload = () => {
+        if (tempImg.width > 0 && tempImg.height > 0) {
+          const ratio = tempImg.height / tempImg.width;
+          imgHeight = Math.min(120, imgWidth * ratio); // cap at 120mm max
+        }
+        resolve();
+      };
+      tempImg.onerror = () => resolve(); // fallback to default height
+      tempImg.src = imageBase64;
+    });
+    // jsPDF is synchronous, so we use the Image() trick inline
+    // For stitched ComfyUI images (3 square images = 3:1 ratio), height will be ~92mm
+    // For Gemini 16:9 images, height will be ~120mm (stays unchanged)
+    if (imageBase64.includes('data:image')) {
+      // Quick ratio estimation from base64 header — look for PNG IHDR dimensions
+      // For ComfyUI stitched images (3 square = 3:1), use 1/3 of width
+      // Heuristic: if the image has base64Slide2, it's ComfyUI 6-view mode
+      if (img.base64Slide2) {
+        imgHeight = imgWidth / 3; // 3 square images stitched = 3:1 ratio
+      }
+    }
     doc.addImage(imageBase64, 'PNG', margin, 18, imgWidth, imgHeight, undefined, 'FAST');
   } catch (e) {
     console.error("Error adding image to PDF", e);

@@ -313,10 +313,10 @@ const buildViewChain = (
       class_type: 'CFGNorm',
       _meta: { title: `CFGNorm ${viewIndex}` },
     },
-    // Negative conditioning (empty prompt)
+    // Negative conditioning
     [`${p}_neg_encode`]: {
       inputs: {
-        prompt: '',
+        prompt: 'room, interior, environment, background scene, colored background, gray background, dark background, shadows on background, floor, wall, furniture context, multiple objects, text, watermark, labels, dimensions, annotations, blurry, low quality, distorted',
         speak_and_recognation: { __value__: [false, true] },
         clip: ['shared_clip', 0],
         vae: ['shared_vae', 0],
@@ -565,7 +565,7 @@ const buildQwenReferenceWorkflow = (
     // Negative prompt
     'neg_encode': {
       inputs: {
-        prompt: 'blurry, low quality, distorted, deformed, ugly, watermark, text, logo',
+        prompt: 'room, interior, environment, colored background, gray background, dark background, shadows on background, floor, wall, multiple objects, text, watermark, labels, dimensions, blurry, low quality, distorted, deformed, ugly',
         speak_and_recognation: { __value__: [false, true] },
         clip: ['shared_clip', 0],
         vae: ['shared_vae', 0],
