@@ -1105,7 +1105,26 @@ const App: React.FC = () => {
                     </div>
                     <div>
                       <p className="text-xs font-bold text-slate-400 uppercase tracking-wider">Estimation des coûts</p>
-                      {generationMode === 'realtime' ? (
+                      {backend === 'comfyui' ? (
+                        // ComfyUI local costs
+                        comfyRefSource === 'qwen' ? (
+                          <div>
+                            <p className="text-xl font-black text-green-700">
+                              0.000 $
+                              <span className="text-sm font-normal text-green-500 ml-2">(100% local — 0€ / image)</span>
+                            </p>
+                            <p className="text-xs text-green-600">Référence Qwen + 6 vues ComfyUI = tout sur votre GPU</p>
+                          </div>
+                        ) : (
+                          <div>
+                            <p className="text-xl font-black text-orange-700">
+                              {costInfo.total.toFixed(3)} $
+                              <span className="text-sm font-normal text-orange-500 ml-2">({costInfo.perImage.toFixed(3)} $ / réf Gemini + 0€ vues locales)</span>
+                            </p>
+                            <p className="text-xs text-orange-600">1 appel Gemini par image (référence) + 6 vues gratuites sur GPU</p>
+                          </div>
+                        )
+                      ) : generationMode === 'realtime' ? (
                         <p className="text-xl font-black text-slate-900">
                           {(highCoherence ? costInfo.total * 2 : costInfo.total).toFixed(3)} $
                           <span className="text-sm font-normal text-slate-500 ml-2">({(highCoherence ? costInfo.perImage * 2 : costInfo.perImage).toFixed(3)} $ / image{highCoherence ? ' HC' : ''})</span>
@@ -1113,10 +1132,10 @@ const App: React.FC = () => {
                       ) : (
                         <div>
                           <p className="text-xl font-black text-emerald-700">
-                            {costInfo.batchTotal.toFixed(3)} $
-                            <span className="text-sm font-normal text-emerald-500 ml-2">({costInfo.batchPerImage.toFixed(3)} $ / image)</span>
+                            {(highCoherence ? costInfo.total + costInfo.batchTotal : costInfo.batchTotal).toFixed(3)} $
+                            <span className="text-sm font-normal text-emerald-500 ml-2">({(highCoherence ? costInfo.perImage + costInfo.batchPerImage : costInfo.batchPerImage).toFixed(3)} $ / image)</span>
                           </p>
-                          <p className="text-xs text-slate-400 line-through">{costInfo.total.toFixed(3)} $ en temps réel</p>
+                          <p className="text-xs text-slate-400 line-through">{costInfo.total.toFixed(3)} $ en temps réel standard</p>
                         </div>
                       )}
                     </div>
