@@ -429,7 +429,7 @@ export const VIEWS_6_CUSTOM: ViewConfig[] = [
   // Slide 2 — 3 views
   { horizontal_angle: 217, vertical_angle: -22, zoom: 5 },  // Vue 4: 3/4 arrière bas
   { horizontal_angle: 90, vertical_angle: 8, zoom: 5 },     // Vue 5: Profil
-  { horizontal_angle: 0, vertical_angle: 67, zoom: 5 },     // Vue 6: Dessus incliné
+  { horizontal_angle: 0, vertical_angle: 60, zoom: 5 },     // Vue 6: Dessus incliné (max 60° pour QwenMultiangle)
 ];
 
 /** Labels for each view (used in PDF) */
@@ -592,18 +592,26 @@ export const generateWithComfyUI = async (
     onProgress?.('Génération des 6 vues (Qwen)...', value, max);
   });
 
-  if (images.length < 6) {
-    throw new Error(`ComfyUI returned only ${images.length} images instead of 6`);
+  if (images.length < 3) {
+    throw new Error(`ComfyUI returned only ${images.length} images (minimum 3 needed)`);
   }
 
-  // Stitch into 2 sets of 3
+  // Stitch into sets of 3
   onProgress?.('Assemblage des vues...', 90, 100);
   const slide1 = await stitchImages(images.slice(0, 3));
-  const slide2 = await stitchImages(images.slice(3, 6));
+
+  // Slide 2 only if we have enough images (views 4-6)
+  let slide2: string | undefined;
+  if (images.length >= 6) {
+    slide2 = await stitchImages(images.slice(3, 6));
+  } else if (images.length > 3) {
+    // Partial slide 2 with whatever views we got
+    slide2 = await stitchImages(images.slice(3));
+  }
 
   return {
     slide1,
-    slide2,
-    individualViews: images.slice(0, 6),
+    slide2: slide2 || slide1, // Fallback to slide1 if slide2 failed
+    individualViews: images,
   };
 };
