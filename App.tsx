@@ -3,9 +3,12 @@ import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { Upload, FileText, Image as ImageIcon, Download, Loader2, CheckCircle2, AlertCircle, ArrowLeft, Layers, PlayCircle, Monitor, Tv, Zap, FileCode, Clock, CloudUpload, Timer } from 'lucide-react';
 import { extractTextFromFile } from './services/fileService';
 import { analyzePdfContent, generateImageForPrompt } from './services/geminiService';
-import { downloadZip, downloadPdf, downloadGlobalZip, downloadMergedPdf } from './services/exportService';
-import { createBatchJob, pollBatchJob, cancelBatchJob } from './services/batchService';
+import { downloadZip, downloadPdf, downloadGlobalZip, downloadMergedPdf, generateMergedPdfBlob } from './services/exportService';
+import { createBatchJob, createHighCoherenceBatchJob, pollBatchJob, cancelBatchJob } from './services/batchService';
 import { authenticateGoogleDrive, isDriveAuthenticated, uploadBatchResultsToDrive } from './services/driveService';
+import { verifyAllImages, filterConsistentImages, VerificationResult } from './services/viewVerificationService';
+import { backupBatchJob, restoreBatchJob, restoreBatchFromFile, hasBatchBackup, clearBatchBackup } from './services/batchPersistenceService';
+import { getBatchJobStatus, getBatchJobResults } from './services/batchService';
 import { ApiKeySelector } from './components/ApiKeySelector';
 import { PromptGenerator } from './components/PromptGenerator';
 import { PromptGroup, GeneratedImage, AppState, ImageSize, ImageModel, GenerationMode, BatchJob, BatchJobState } from './types';
@@ -36,6 +39,7 @@ const App: React.FC = () => {
   const [selectedResolution, setSelectedResolution] = useState<ImageSize>('4K');
   const [selectedModel, setSelectedModel] = useState<ImageModel>('gemini-3.1-flash-image-preview');
   const [generationMode, setGenerationMode] = useState<GenerationMode>('realtime');
+  const [highCoherence, setHighCoherence] = useState(true);
 
   const [generatedImages, setGeneratedImages] = useState<GeneratedImage[]>([]);
   const [allGeneratedImages, setAllGeneratedImages] = useState<GeneratedImage[]>([]);
@@ -50,11 +54,22 @@ const App: React.FC = () => {
   // Drive state
   const [driveLink, setDriveLink] = useState<string | null>(null);
   const [driveUploadProgress, setDriveUploadProgress] = useState<{ current: number; total: number } | null>(null);
+  const [driveAutoStatus, setDriveAutoStatus] = useState<'idle' | 'uploading' | 'done' | 'error'>('idle');
+
+  // Verification state
+  const [verificationResults, setVerificationResults] = useState<VerificationResult[]>([]);
+  const [verificationProgress, setVerificationProgress] = useState<{ current: number; total: number; currentItem: string } | null>(null);
+  const [rejectedImages, setRejectedImages] = useState<GeneratedImage[]>([]);
+
+  // Batch backup state
+  const [hasBackup, setHasBackup] = useState(hasBatchBackup());
+  const [isRestoring, setIsRestoring] = useState(false);
 
   // Drag and drop state
   const [isDragOver, setIsDragOver] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const backupFileInputRef = useRef<HTMLInputElement>(null);
 
   // Listen for generated prompts from the PromptGenerator component
   useEffect(() => {
@@ -159,7 +174,7 @@ const App: React.FC = () => {
 
         while (attempts < maxAttempts) {
           try {
-            base64 = await generateImageForPrompt(item.prompt, selectedResolution, selectedModel);
+            base64 = await generateImageForPrompt(item.prompt, selectedResolution, selectedModel, highCoherence);
             break;
           } catch (err: any) {
             attempts++;
@@ -227,7 +242,7 @@ const App: React.FC = () => {
 
           while (attempts < maxAttempts) {
             try {
-              base64 = await generateImageForPrompt(item.prompt, selectedResolution, selectedModel);
+              base64 = await generateImageForPrompt(item.prompt, selectedResolution, selectedModel, highCoherence);
               break;
             } catch (err: any) {
               attempts++;
@@ -253,9 +268,44 @@ const App: React.FC = () => {
       if (isStopping) {
         setAppState(AppState.SELECTING);
       } else {
+        // Step 2: Verify image consistency
+        setProgress({ current: 0, total: allImages.length, status: 'Vérification de la cohérence des vues...', groupName: '' });
+        const verResults = await verifyAllImages(
+          allImages,
+          (img) => {
+            const group = groups.find(g => g.id === img.groupId);
+            return group?.items[img.itemId]?.name || `Image ${img.itemId}`;
+          },
+          (current, total, currentItem) => {
+            setVerificationProgress({ current, total, currentItem });
+            setProgress({ current, total, status: `Vérification: "${currentItem}"...`, groupName: 'Contrôle qualité' });
+          }
+        );
+
+        setVerificationResults(verResults);
+        setVerificationProgress(null);
+
+        // Separate consistent and rejected images
+        const { consistent, rejected } = filterConsistentImages(allImages, verResults);
+        setRejectedImages(rejected);
+
+        const rejectedCount = rejected.length;
+        if (rejectedCount > 0) {
+          setError(`${rejectedCount} image(s) rejetée(s) pour incohérence entre les vues. Elles sont exclues du catalogue PDF.`);
+        }
+
         setAppState(AppState.FINISHED_ALL);
+
+        // Step 3: Auto-download ZIP (all images) and PDF (only consistent ones)
         setTimeout(() => { downloadGlobalZip(groups, allImages); }, 500);
-        setTimeout(() => { downloadMergedPdf(groups, allImages); }, 2000);
+        if (consistent.length > 0) {
+          setTimeout(() => { downloadMergedPdf(groups, consistent); }, 2000);
+        }
+
+        // Step 4: Auto-upload to Drive
+        if (isDriveAuthenticated()) {
+          await autoUploadToDrive(allImages, consistent);
+        }
       }
     } catch (err: any) {
       console.error(err);
@@ -280,8 +330,29 @@ const App: React.FC = () => {
     setDriveLink(null);
 
     try {
-      const job = await createBatchJob(groups, selectedResolution, selectedModel);
+      let job: BatchJob;
+
+      if (highCoherence) {
+        // High Coherence batch: pre-generate reference images, then batch the 3-views
+        setProgress({ current: 0, total: groups.reduce((a, g) => a + g.items.length, 0), status: 'Génération des images de référence...', groupName: 'Pass 1 — Références' });
+
+        job = await createHighCoherenceBatchJob(
+          groups, selectedResolution, selectedModel,
+          (current, total, itemName) => {
+            setProgress({ current, total, status: `Référence: "${itemName}" (${current}/${total})`, groupName: 'Pass 1 — Références' });
+          }
+        );
+
+        setProgress(null);
+      } else {
+        // Standard batch
+        job = await createBatchJob(groups, selectedResolution, selectedModel);
+      }
+
       setActiveBatchJob(job);
+      // Auto-backup the batch job for recovery after server restart
+      backupBatchJob(job);
+      setHasBackup(true);
       setAppState(AppState.BATCH_MONITORING);
 
       // Start polling
@@ -313,12 +384,38 @@ const App: React.FC = () => {
 
       setAllGeneratedImages(images);
 
-      // Auto-upload to Drive if authenticated
-      if (isDriveAuthenticated() && images.length > 0) {
-        await uploadToDrive(images);
+      // Verify image consistency
+      const verResults = await verifyAllImages(
+        images,
+        (img) => {
+          const group = groups.find(g => g.id === img.groupId);
+          return group?.items[img.itemId]?.name || `Image ${img.itemId}`;
+        },
+        (current, total, currentItem) => {
+          setVerificationProgress({ current, total, currentItem });
+        }
+      );
+
+      setVerificationResults(verResults);
+      setVerificationProgress(null);
+
+      const { consistent, rejected } = filterConsistentImages(images, verResults);
+      setRejectedImages(rejected);
+
+      if (rejected.length > 0) {
+        setError(`${rejected.length} image(s) rejetée(s) pour incohérence entre les vues.`);
       }
 
       setAppState(AppState.FINISHED_ALL);
+
+      // Batch succeeded — clear backup
+      clearBatchBackup();
+      setHasBackup(false);
+
+      // Auto-upload to Drive if authenticated
+      if (isDriveAuthenticated() && images.length > 0) {
+        await autoUploadToDrive(images, consistent);
+      }
 
     } catch (err: any) {
       console.error(err);
@@ -333,6 +430,8 @@ const App: React.FC = () => {
     if (activeBatchJob) {
       try {
         await cancelBatchJob(activeBatchJob.name);
+        clearBatchBackup();
+        setHasBackup(false);
         setAppState(AppState.SELECTING);
         setActiveBatchJob(null);
         setBatchProgress(null);
@@ -342,16 +441,179 @@ const App: React.FC = () => {
     }
   };
 
+  const handleBackupBatch = () => {
+    if (activeBatchJob) {
+      backupBatchJob(activeBatchJob);
+      setHasBackup(true);
+    }
+  };
+
+  const handleRestoreBatch = async () => {
+    const backup = restoreBatchJob();
+    if (!backup) {
+      setError('Aucun batch sauvegardé trouvé.');
+      return;
+    }
+
+    setIsRestoring(true);
+    setError(null);
+
+    try {
+      const job = backup.job;
+
+      // Check current status of the batch at Google
+      const status = await getBatchJobStatus(job.name);
+
+      // Restore groups so we can map results back
+      setGroups(job.groups);
+      setActiveBatchJob(job);
+      setSelectedResolution(job.resolution);
+
+      if (status.state === 'JOB_STATE_SUCCEEDED') {
+        // Batch already finished — retrieve results directly
+        setAppState(AppState.BATCH_MONITORING);
+        setBatchProgress({ state: 'JOB_STATE_SUCCEEDED', completed: status.completedRequests, failed: status.failedRequests });
+
+        const results = await getBatchJobResults(job.name);
+
+        // Convert to GeneratedImage
+        const images: GeneratedImage[] = [];
+        for (const group of job.groups) {
+          for (let i = 0; i < group.items.length; i++) {
+            const key = `g${group.id}_i${i}_${group.items[i].name.replace(/[^a-z0-9]/gi, '_').substring(0, 20)}`;
+            const base64 = results.get(key);
+            if (base64) {
+              images.push({ groupId: group.id, itemId: i, prompt: group.items[i].prompt, base64, resolution: job.resolution });
+            }
+          }
+        }
+
+        setAllGeneratedImages(images);
+
+        // Verify consistency
+        const verResults = await verifyAllImages(
+          images,
+          (img) => {
+            const g = job.groups.find(gr => gr.id === img.groupId);
+            return g?.items[img.itemId]?.name || `Image ${img.itemId}`;
+          },
+          (current, total, currentItem) => setVerificationProgress({ current, total, currentItem })
+        );
+        setVerificationResults(verResults);
+        setVerificationProgress(null);
+
+        const { consistent, rejected } = filterConsistentImages(images, verResults);
+        setRejectedImages(rejected);
+        if (rejected.length > 0) {
+          setError(`${rejected.length} image(s) rejetée(s) pour incohérence.`);
+        }
+
+        setAppState(AppState.FINISHED_ALL);
+        clearBatchBackup();
+        setHasBackup(false);
+
+        // Auto-upload to Drive
+        if (isDriveAuthenticated() && images.length > 0) {
+          await autoUploadToDrive(images, consistent);
+        }
+
+      } else if (status.state === 'JOB_STATE_FAILED' || status.state === 'JOB_STATE_CANCELLED') {
+        setError(`Le batch a échoué ou a été annulé (état: ${status.state}).`);
+        clearBatchBackup();
+        setHasBackup(false);
+        setAppState(AppState.SELECTING);
+      } else {
+        // Still running — resume polling
+        setAppState(AppState.BATCH_MONITORING);
+        setBatchProgress({ state: status.state, completed: status.completedRequests, failed: status.failedRequests });
+
+        const results = await pollBatchJob(
+          job.name,
+          (state, completed, failed) => setBatchProgress({ state, completed, failed }),
+          15000
+        );
+
+        // Convert results
+        const images: GeneratedImage[] = [];
+        for (const group of job.groups) {
+          for (let i = 0; i < group.items.length; i++) {
+            const key = `g${group.id}_i${i}_${group.items[i].name.replace(/[^a-z0-9]/gi, '_').substring(0, 20)}`;
+            const base64 = results.get(key);
+            if (base64) {
+              images.push({ groupId: group.id, itemId: i, prompt: group.items[i].prompt, base64, resolution: job.resolution });
+            }
+          }
+        }
+
+        setAllGeneratedImages(images);
+
+        const verResults = await verifyAllImages(
+          images,
+          (img) => {
+            const g = job.groups.find(gr => gr.id === img.groupId);
+            return g?.items[img.itemId]?.name || `Image ${img.itemId}`;
+          },
+          (current, total, currentItem) => setVerificationProgress({ current, total, currentItem })
+        );
+        setVerificationResults(verResults);
+        setVerificationProgress(null);
+
+        const { consistent, rejected } = filterConsistentImages(images, verResults);
+        setRejectedImages(rejected);
+        if (rejected.length > 0) {
+          setError(`${rejected.length} image(s) rejetée(s) pour incohérence.`);
+        }
+
+        setAppState(AppState.FINISHED_ALL);
+        clearBatchBackup();
+        setHasBackup(false);
+
+        if (isDriveAuthenticated() && images.length > 0) {
+          await autoUploadToDrive(images, consistent);
+        }
+      }
+    } catch (err: any) {
+      console.error(err);
+      setError("Erreur lors de la restauration du batch: " + err.message);
+      setAppState(AppState.SELECTING);
+    } finally {
+      setIsRestoring(false);
+      setBatchProgress(null);
+    }
+  };
+
+  const handleRestoreFromFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const content = reader.result as string;
+      const backup = restoreBatchFromFile(content);
+      if (backup) {
+        setHasBackup(true);
+        // Immediately trigger the restore
+        handleRestoreBatch();
+      } else {
+        setError('Fichier de backup invalide. Veuillez sélectionner un fichier batch_backup.json valide.');
+      }
+    };
+    reader.readAsText(file);
+    // Reset input so the same file can be re-selected
+    e.target.value = '';
+  };
+
   // --- Google Drive ---
 
-  const uploadToDrive = async (images: GeneratedImage[]) => {
+  /**
+   * Auto-uploads all images + PDF catalog (only consistent images) to Drive.
+   * Called automatically after generation completes.
+   */
+  const autoUploadToDrive = async (allImages: GeneratedImage[], consistentImages: GeneratedImage[]) => {
     try {
-      if (!isDriveAuthenticated()) {
-        await authenticateGoogleDrive();
-      }
+      setDriveAutoStatus('uploading');
 
       const dateStr = new Date().toISOString().split('T')[0];
-      const driveImages = images.map(img => {
+      const driveImages = allImages.map(img => {
         const group = groups.find(g => g.id === img.groupId);
         return {
           groupName: group?.name || `Groupe ${img.groupId}`,
@@ -360,29 +622,46 @@ const App: React.FC = () => {
         };
       });
 
-      setDriveUploadProgress({ current: 0, total: driveImages.length });
+      // Generate PDF catalog blob with ONLY consistent images
+      let pdfBlob: Blob | undefined;
+      try {
+        if (consistentImages.length > 0) {
+          const relevantGroups = groups.filter(g => consistentImages.some(img => img.groupId === g.id));
+          pdfBlob = generateMergedPdfBlob(relevantGroups, consistentImages);
+        }
+      } catch (e) {
+        console.warn('Could not generate PDF for Drive upload:', e);
+      }
 
+      const totalItems = driveImages.length + (pdfBlob ? 1 : 0);
+      setDriveUploadProgress({ current: 0, total: totalItems });
+
+      const commandName = `Generation_${dateStr}`;
       const link = await uploadBatchResultsToDrive(
         driveImages,
-        `Objects_Generator_${dateStr}`,
-        (current, total) => setDriveUploadProgress({ current, total })
+        commandName,
+        (current, total) => setDriveUploadProgress({ current, total }),
+        pdfBlob
       );
 
       setDriveLink(link);
       setDriveUploadProgress(null);
+      setDriveAutoStatus('done');
     } catch (err: any) {
       console.error(err);
       setError("Erreur upload Drive: " + err.message);
       setDriveUploadProgress(null);
+      setDriveAutoStatus('error');
     }
   };
 
   const handleConnectDrive = async () => {
     try {
       await authenticateGoogleDrive();
-      // If we have images, offer to upload
+      // If we already have images, trigger auto-upload now
       if (allGeneratedImages.length > 0) {
-        await uploadToDrive(allGeneratedImages);
+        const { consistent } = filterConsistentImages(allGeneratedImages, verificationResults);
+        await autoUploadToDrive(allGeneratedImages, consistent);
       }
     } catch (err: any) {
       setError(err.message);
@@ -408,6 +687,10 @@ const App: React.FC = () => {
     setGeneratedImages([]);
     setAllGeneratedImages([]);
     setDriveLink(null);
+    setDriveAutoStatus('idle');
+    setVerificationResults([]);
+    setVerificationProgress(null);
+    setRejectedImages([]);
     setAppState(AppState.SELECTING);
   };
 
@@ -480,6 +763,61 @@ const App: React.FC = () => {
                 Sélectionner un fichier
               </button>
             </div>
+
+            {/* Restore batch backup banner — from localStorage */}
+            {hasBackup && (
+              <div className="mt-6 bg-blue-50 border border-blue-200 rounded-2xl p-5 flex items-center justify-between">
+                <div>
+                  <h3 className="font-bold text-blue-900">Batch sauvegardé détecté</h3>
+                  <p className="text-sm text-blue-700 mt-1">Un batch différé a été sauvegardé avant la fermeture du serveur. Restaurez-le pour récupérer vos images.</p>
+                </div>
+                <div className="flex gap-3 ml-4">
+                  <button
+                    onClick={handleRestoreBatch}
+                    disabled={isRestoring}
+                    className="inline-flex items-center px-5 py-2.5 bg-blue-600 text-white rounded-xl font-bold hover:bg-blue-700 transition-all shadow-lg disabled:opacity-50"
+                  >
+                    {isRestoring ? (
+                      <><Loader2 className="w-4 h-4 mr-2 animate-spin" /> Restauration...</>
+                    ) : (
+                      <><Upload className="w-4 h-4 mr-2" /> Restaurer le batch</>
+                    )}
+                  </button>
+                  <button
+                    onClick={() => { clearBatchBackup(); setHasBackup(false); }}
+                    className="inline-flex items-center px-4 py-2.5 bg-white text-slate-600 rounded-xl font-medium border border-slate-200 hover:bg-slate-50 transition-all"
+                  >
+                    Ignorer
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Restore from file — always visible as fallback */}
+            {!hasBackup && (
+              <div className="mt-6 bg-slate-50 border border-slate-200 rounded-2xl p-4 flex items-center justify-between">
+                <div>
+                  <h3 className="font-medium text-slate-700 text-sm">Restaurer un batch depuis un fichier</h3>
+                  <p className="text-xs text-slate-500 mt-0.5">Si vous avez un fichier batch_backup.json d'une session précédente.</p>
+                </div>
+                <div>
+                  <input
+                    type="file"
+                    ref={backupFileInputRef}
+                    accept=".json"
+                    onChange={handleRestoreFromFile}
+                    className="hidden"
+                  />
+                  <button
+                    onClick={() => backupFileInputRef.current?.click()}
+                    disabled={isRestoring}
+                    className="inline-flex items-center px-4 py-2 bg-white text-slate-700 rounded-lg font-medium text-sm border border-slate-300 hover:bg-slate-100 transition-all disabled:opacity-50"
+                  >
+                    <FileText className="w-4 h-4 mr-1.5" /> Charger un backup
+                  </button>
+                </div>
+              </div>
+            )}
 
             {/* Prompt Generator — create prompt files automatically */}
             <div className="mt-8">
@@ -586,6 +924,35 @@ const App: React.FC = () => {
                 </div>
               </div>
 
+              {/* High Coherence Toggle — available for both realtime and batch */}
+              <div>
+                <button
+                  onClick={() => setHighCoherence(!highCoherence)}
+                  className={`w-full flex items-center gap-3 p-4 rounded-xl border-2 transition-all text-left ${
+                    highCoherence ? 'border-amber-500 bg-amber-50' : 'border-slate-100 hover:border-slate-200'
+                  }`}
+                >
+                  <div className={`w-10 h-6 rounded-full relative transition-colors ${highCoherence ? 'bg-amber-500' : 'bg-slate-300'}`}>
+                    <div className={`w-4 h-4 bg-white rounded-full absolute top-1 transition-all shadow ${highCoherence ? 'left-5' : 'left-1'}`} />
+                  </div>
+                  <div className="flex-1">
+                    <span className={`font-bold block ${highCoherence ? 'text-amber-800' : 'text-slate-700'}`}>
+                      Haute cohérence
+                      {highCoherence && generationMode === 'realtime' && <span className="ml-2 text-xs bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full">x2 appels API</span>}
+                      {highCoherence && generationMode === 'batch' && <span className="ml-2 text-xs bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full">refs temps réel + batch -50%</span>}
+                    </span>
+                    <span className="text-xs text-slate-500">
+                      {highCoherence
+                        ? generationMode === 'batch'
+                          ? 'Pré-génère les images de référence en temps réel, puis lance le batch des 3 vues avec chaque référence. Le batch bénéficie toujours du -50%.'
+                          : 'Génère d\'abord une image de référence, puis les 3 vues à partir de cette référence. Réduit fortement les rejets.'
+                        : 'Génération directe des 3 vues en un seul appel. Plus rapide mais plus de rejets possibles.'
+                      }
+                    </span>
+                  </div>
+                </button>
+              </div>
+
               {/* Cost + Action Row */}
               <div className="pt-6 border-t border-slate-100 flex flex-col md:flex-row items-center justify-between gap-6">
                 <div className="bg-slate-50 p-4 rounded-xl border border-slate-100 w-full md:w-auto">
@@ -597,8 +964,8 @@ const App: React.FC = () => {
                       <p className="text-xs font-bold text-slate-400 uppercase tracking-wider">Estimation des coûts</p>
                       {generationMode === 'realtime' ? (
                         <p className="text-xl font-black text-slate-900">
-                          {costInfo.total.toFixed(3)} $
-                          <span className="text-sm font-normal text-slate-500 ml-2">({costInfo.perImage.toFixed(3)} $ / image)</span>
+                          {(highCoherence ? costInfo.total * 2 : costInfo.total).toFixed(3)} $
+                          <span className="text-sm font-normal text-slate-500 ml-2">({(highCoherence ? costInfo.perImage * 2 : costInfo.perImage).toFixed(3)} $ / image{highCoherence ? ' HC' : ''})</span>
                         </p>
                       ) : (
                         <div>
@@ -775,16 +1142,25 @@ const App: React.FC = () => {
             )}
 
             <p className="text-sm text-slate-400 mt-6">
-              Le traitement peut prendre de quelques minutes à 24 heures. Vous pouvez fermer cette page — les résultats seront disponibles sur votre Drive.
+              Le traitement peut prendre de quelques minutes à 24 heures. Vous pouvez sauvegarder le batch avant de fermer, puis le restaurer au redémarrage.
             </p>
 
-            <button
-              onClick={handleCancelBatch}
-              className="mt-6 inline-flex items-center px-6 py-3 bg-red-50 text-red-600 hover:bg-red-100 border border-red-100 rounded-xl font-bold transition-all"
-            >
-              <AlertCircle className="w-4 h-4 mr-2" />
-              Annuler le batch
-            </button>
+            <div className="flex gap-3 mt-6">
+              <button
+                onClick={handleBackupBatch}
+                className="inline-flex items-center px-6 py-3 bg-blue-50 text-blue-600 hover:bg-blue-100 border border-blue-100 rounded-xl font-bold transition-all"
+              >
+                <Download className="w-4 h-4 mr-2" />
+                {hasBackup ? 'Batch sauvegardé ✓' : 'Sauvegarder le batch'}
+              </button>
+              <button
+                onClick={handleCancelBatch}
+                className="inline-flex items-center px-6 py-3 bg-red-50 text-red-600 hover:bg-red-100 border border-red-100 rounded-xl font-bold transition-all"
+              >
+                <AlertCircle className="w-4 h-4 mr-2" />
+                Annuler le batch
+              </button>
+            </div>
           </div>
         )}
 
@@ -845,37 +1221,84 @@ const App: React.FC = () => {
                 <h2 className="text-3xl font-bold text-slate-900 bg-clip-text text-transparent bg-gradient-to-r from-indigo-600 to-purple-600">
                   Génération Terminée !
                 </h2>
-                <p className="text-slate-500 mt-1">{allGeneratedImages.length} images générées en {selectedResolution}.</p>
+                <p className="text-slate-500 mt-1">
+                  {allGeneratedImages.length} images générées en {selectedResolution}
+                  {rejectedImages.length > 0 && (
+                    <span className="text-amber-600"> — {allGeneratedImages.length - rejectedImages.length} validées, {rejectedImages.length} rejetée(s)</span>
+                  )}
+                </p>
               </div>
               <div className="flex flex-col sm:flex-row gap-4 w-full lg:w-auto">
                 <button onClick={handleDownloadGlobalZip} className="flex-1 lg:flex-none inline-flex items-center justify-center px-6 py-3 bg-white border-2 border-slate-200 rounded-xl font-bold text-slate-700 hover:border-indigo-500 hover:text-indigo-600 shadow-sm transition-all">
                   <Download className="w-5 h-5 mr-2" /> ZIP Complet
                 </button>
-                <button onClick={() => downloadMergedPdf(groups, allGeneratedImages)} className="flex-1 lg:flex-none inline-flex items-center justify-center px-6 py-3 bg-indigo-600 text-white rounded-xl font-bold shadow-lg hover:bg-indigo-700 shadow-indigo-500/30 transition-all">
-                  <FileText className="w-5 h-5 mr-2" /> PDF Complet
+                <button onClick={() => {
+                  const { consistent } = filterConsistentImages(allGeneratedImages, verificationResults);
+                  downloadMergedPdf(groups, consistent.length > 0 ? consistent : allGeneratedImages);
+                }} className="flex-1 lg:flex-none inline-flex items-center justify-center px-6 py-3 bg-indigo-600 text-white rounded-xl font-bold shadow-lg hover:bg-indigo-700 shadow-indigo-500/30 transition-all">
+                  <FileText className="w-5 h-5 mr-2" /> PDF Catalogue
                 </button>
-                {!driveLink && (
-                  <button onClick={() => uploadToDrive(allGeneratedImages)} className="flex-1 lg:flex-none inline-flex items-center justify-center px-6 py-3 bg-emerald-600 text-white rounded-xl font-bold shadow-lg hover:bg-emerald-700 shadow-emerald-500/30 transition-all">
-                    <CloudUpload className="w-5 h-5 mr-2" /> Upload Drive
+                {/* Drive status indicator (replaces Upload button) */}
+                {driveAutoStatus === 'done' && driveLink ? (
+                  <a href={driveLink} target="_blank" rel="noreferrer" className="flex-1 lg:flex-none inline-flex items-center justify-center px-6 py-3 bg-emerald-100 text-emerald-700 rounded-xl font-bold border-2 border-emerald-300 transition-all">
+                    <CheckCircle2 className="w-5 h-5 mr-2" /> Drive OK
+                  </a>
+                ) : driveAutoStatus === 'uploading' ? (
+                  <div className="flex-1 lg:flex-none inline-flex items-center justify-center px-6 py-3 bg-emerald-50 text-emerald-600 rounded-xl font-bold border-2 border-emerald-200">
+                    <Loader2 className="w-5 h-5 mr-2 animate-spin" /> Upload...
+                  </div>
+                ) : driveAutoStatus === 'error' ? (
+                  <button onClick={() => {
+                    const { consistent } = filterConsistentImages(allGeneratedImages, verificationResults);
+                    autoUploadToDrive(allGeneratedImages, consistent);
+                  }} className="flex-1 lg:flex-none inline-flex items-center justify-center px-6 py-3 bg-red-50 text-red-600 rounded-xl font-bold border-2 border-red-200 hover:bg-red-100 transition-all">
+                    <AlertCircle className="w-5 h-5 mr-2" /> Réessayer Drive
                   </button>
-                )}
+                ) : !isDriveAuthenticated() ? (
+                  <button onClick={handleConnectDrive} className="flex-1 lg:flex-none inline-flex items-center justify-center px-6 py-3 bg-emerald-600 text-white rounded-xl font-bold shadow-lg hover:bg-emerald-700 shadow-emerald-500/30 transition-all">
+                    <CloudUpload className="w-5 h-5 mr-2" /> Connecter Drive
+                  </button>
+                ) : null}
               </div>
             </div>
 
-            {/* Drive upload progress or link */}
+            {/* Drive upload progress */}
             {driveUploadProgress && (
               <div className="mb-6 bg-emerald-50 border border-emerald-200 rounded-xl p-4 flex items-center gap-3">
                 <Loader2 className="w-5 h-5 text-emerald-600 animate-spin" />
-                <span className="text-emerald-700 font-medium">Upload Drive: {driveUploadProgress.current}/{driveUploadProgress.total} images...</span>
+                <span className="text-emerald-700 font-medium">Upload Drive: {driveUploadProgress.current}/{driveUploadProgress.total} fichiers...</span>
               </div>
             )}
-            {driveLink && (
+            {driveLink && !driveUploadProgress && (
               <div className="mb-6 bg-emerald-50 border border-emerald-200 rounded-xl p-4 flex items-center gap-3">
                 <CheckCircle2 className="w-5 h-5 text-emerald-600" />
-                <span className="text-emerald-700 font-medium">Images uploadées sur Drive !</span>
+                <span className="text-emerald-700 font-medium">Images + PDF catalogue uploadés sur Drive !</span>
                 <a href={driveLink} target="_blank" rel="noreferrer" className="ml-auto text-emerald-600 hover:text-emerald-800 underline font-bold text-sm">
                   Ouvrir le dossier
                 </a>
+              </div>
+            )}
+
+            {/* Verification summary */}
+            {rejectedImages.length > 0 && (
+              <div className="mb-6 bg-amber-50 border border-amber-200 rounded-xl p-4">
+                <div className="flex items-center gap-2 mb-2">
+                  <AlertCircle className="w-5 h-5 text-amber-600" />
+                  <span className="text-amber-800 font-bold">{rejectedImages.length} objet(s) rejeté(s) — vues incohérentes</span>
+                </div>
+                <p className="text-amber-700 text-sm mb-3">Ces images ont été exclues du PDF catalogue car les 3 vues ne montrent pas exactement le même objet.</p>
+                <div className="space-y-2">
+                  {verificationResults.filter(r => !r.isConsistent).map((r, idx) => (
+                    <div key={idx} className="bg-white rounded-lg p-3 border border-amber-100">
+                      <span className="font-bold text-slate-800">{r.itemName}</span>
+                      <ul className="mt-1 text-sm text-amber-700">
+                        {r.issues.map((issue, i) => (
+                          <li key={i}>• {issue}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
 
@@ -890,20 +1313,37 @@ const App: React.FC = () => {
                       <h3 className="text-2xl font-bold text-slate-800">{group.name}</h3>
                     </div>
                     <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                      {pImgs.map((img, idx) => (
-                        <div key={idx} className="group relative rounded-xl overflow-hidden shadow-md">
-                          <img src={img.base64} alt="preview" className="w-full aspect-video object-cover" />
-                          <div className="absolute top-2 right-2 bg-black/40 text-white text-[10px] px-1.5 py-0.5 rounded backdrop-blur-sm">{img.resolution}</div>
-                          <div className="absolute bottom-0 left-0 right-0 bg-black/40 backdrop-blur-sm flex justify-between px-2 py-1 text-[8px] font-bold text-white/80">
-                            <span>FACE</span>
-                            <span>PROFIL</span>
-                            <span>ARRIÈRE</span>
+                      {pImgs.map((img, idx) => {
+                        const verResult = verificationResults.find(r => r.groupId === img.groupId && r.itemId === img.itemId);
+                        const isRejected = verResult && !verResult.isConsistent;
+                        return (
+                          <div key={idx} className={`group relative rounded-xl overflow-hidden shadow-md ${isRejected ? 'ring-2 ring-red-400 opacity-70' : ''}`}>
+                            <img src={img.base64} alt="preview" className="w-full aspect-video object-cover" />
+                            <div className="absolute top-2 right-2 bg-black/40 text-white text-[10px] px-1.5 py-0.5 rounded backdrop-blur-sm">{img.resolution}</div>
+                            {/* Verification badge */}
+                            <div className="absolute top-2 left-2">
+                              {isRejected ? (
+                                <span className="bg-red-500 text-white text-[10px] px-2 py-0.5 rounded-full font-bold">REJETÉ</span>
+                              ) : verResult?.isConsistent ? (
+                                <span className="bg-green-500 text-white text-[10px] px-2 py-0.5 rounded-full font-bold">VALIDÉ</span>
+                              ) : null}
+                            </div>
+                            <div className="absolute bottom-0 left-0 right-0 bg-black/40 backdrop-blur-sm flex justify-between px-2 py-1 text-[8px] font-bold text-white/80">
+                              <span>FACE</span>
+                              <span>PROFIL</span>
+                              <span>ARRIÈRE</span>
+                            </div>
+                            <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center p-2 text-center">
+                              <div>
+                                <span className="text-white text-xs font-medium block">{group.items[img.itemId].name}</span>
+                                {isRejected && verResult?.issues && (
+                                  <span className="text-red-300 text-[10px] block mt-1">{verResult.issues.join(', ')}</span>
+                                )}
+                              </div>
+                            </div>
                           </div>
-                          <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center p-2 text-center">
-                            <span className="text-white text-xs font-medium">{group.items[img.itemId].name}</span>
-                          </div>
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   </div>
                 );

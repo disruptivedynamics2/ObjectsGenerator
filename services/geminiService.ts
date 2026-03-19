@@ -162,58 +162,209 @@ export const analyzePdfContent = async (text: string): Promise<PromptGroup[]> =>
  * Exported so it can be reused by batchService.
  */
 export const buildEnhancedPrompt = (prompt: string): string => {
-  return `Technical orthographic reference sheet of a single object: ${prompt}.
+  // Detect round/oval/symmetrical objects that need elevated camera angle
+  const lowerPrompt = prompt.toLowerCase();
+  const needsElevatedView = /\b(rond|ronde|ronds|rondes|circulaire|ovale|ovales|cylindr|sphér|boule|dôme|round|circular|oval|cylinder|sphere|ball|dome|table\s+(ronde|basse|d'appoint|guéridon)|guéridon|pouf|tabouret|vase|bol|plateau|miroir\s+rond|lampe\s+(boule|champignon|globe)|abat-jour)\b/i.test(lowerPrompt);
 
-FORMAT: One horizontal image divided into exactly 3 equal panels arranged LEFT to RIGHT in a single row.
+  const cameraAngle = needsElevatedView
+    ? `CAMERA ELEVATION: This object has a round, oval, or highly symmetrical shape. Use a SLIGHTLY ELEVATED camera (15-20° above eye level, looking slightly downward) for ALL 3 views so the top surface is partially visible and each view is distinguishable. The camera still rotates at 0°, 90°, 180° azimuth — only the vertical elevation changes.`
+    : `CAMERA ELEVATION: Straight-on eye-level camera (0° elevation). The camera rotates horizontally around the object.`;
 
-PANEL LAYOUT (strict):
-  Panel 1 (left third): FRONT elevation view, camera at 0° azimuth
-  Panel 2 (center third): RIGHT SIDE elevation view, camera at 90° azimuth
-  Panel 3 (right third): REAR elevation view, camera at 180° azimuth
+  return `TASK: Create a single image showing ONE object photographed from exactly 3 angles, like a product turnaround sheet.
 
-IDENTITY LOCK — the object in all 3 panels MUST be:
-  • The exact same model, shape, silhouette, proportions and scale
-  • The exact same materials, colors, textures, patterns and finishes
-  • The exact same details: handles, legs, edges, stitching, hardware
-  • Only the camera angle changes — nothing else differs between panels
+STEP 1 — DESIGN THE OBJECT (do this mentally before rendering):
+Design one single, specific object matching this description: ${prompt}.
+Lock in every detail: exact shape, exact number of legs/drawers/handles/shelves, exact materials, exact colors, exact proportions, exact hardware. This locked design is the ONLY object that appears in all 3 panels. Think of it as one real physical object being photographed 3 times — because that is exactly what this is.
 
-COMPOSITION RULES:
-  • Pure solid white (#FFFFFF) background with no shadows on background
-  • Soft, even studio lighting from slightly above, no dramatic shadows
-  • Each panel occupies exactly one-third of the total width
-  • Object centered vertically and horizontally within each panel
-  • Consistent scale: the object appears the same size in all 3 panels
-  • Thin subtle light gray vertical dividers between panels
+STEP 2 — RENDER THE TURNAROUND:
+Create one wide horizontal image split into exactly 3 equal vertical panels side by side:
 
-FORBIDDEN:
-  • No text, labels, watermarks, annotations, or dimensions
-  • No perspective distortion — use flat orthographic projection
-  • No additional objects, decorations, or context
-  • No more and no fewer than exactly 3 views
-  • No vertical stacking or multiple rows
-  • No variations in the object design between views
+  LEFT PANEL:   FRONT view — camera faces the object straight on (0° azimuth)
+  CENTER PANEL: RIGHT SIDE view — camera has moved 90° clockwise around the same object
+  RIGHT PANEL:  REAR view — camera has moved 180° around the same object (seeing the back)
 
-RENDERING: Photorealistic product visualization, 8K resolution, sharp focus, professional catalog quality.`;
+${cameraAngle}
+
+CRITICAL CONSISTENCY RULES (these are the #1 priority):
+  1. SAME OBJECT: All 3 panels show the IDENTICAL object. Not similar — identical. Same silhouette, same proportions, same height, same width.
+  2. SAME STRUCTURE: Exact same number of legs, arms, drawers, handles, shelves, panels, cushions, buttons in every view. If the front has 4 legs, the side and back must also show the correct 4 legs from their respective angles.
+  3. SAME SURFACE: Exact same materials, wood grain direction, fabric texture, color shade, upholstery pattern, stitching, hardware finish in all panels.
+  4. SAME SCALE: The object must appear the same physical size in all 3 panels — same height in pixels, same apparent volume.
+  5. ANGULAR CORRECTNESS: Features visible from the front (like a handle on the front face) should NOT appear on the back view unless they physically exist on both sides. Think about what is truly visible from each angle.
+  6. NO MORPHING: The object must not subtly change shape, add/remove details, or shift proportions between panels. It is ONE frozen object, just rotated.
+
+COMPOSITION:
+  • Pure white (#FFFFFF) background, no floor shadow, no gradient
+  • Soft even studio lighting from above, no dramatic shadows
+  • Each panel = exactly one third of the total image width
+  • Object perfectly centered (vertically and horizontally) in each panel
+  • Thin light gray vertical lines separating the 3 panels
+
+ABSOLUTELY FORBIDDEN:
+  • Any text, labels, watermarks, annotations, or dimension markings
+  • Any decorative props, plants, or context objects
+  • More or fewer than exactly 3 views
+  • Vertical stacking — panels must be horizontal, left to right
+  • Any variation in the object's design between the 3 views
+
+RENDERING QUALITY: Photorealistic product photography, 8K resolution, crisp focus, professional catalog standard.`;
+};
+
+/**
+ * Builds a prompt for generating a single reference view (Pass 1 of high-coherence mode).
+ */
+export const buildReferencePrompt = (prompt: string): string => {
+  return `Create a single photorealistic product photograph of this object: ${prompt}.
+
+REQUIREMENTS:
+- Show the object from a FRONT 3/4 VIEW (slightly angled, about 30° to the right) so we can see both the front face and one side.
+- The object must be FULLY visible from top to bottom, nothing cropped.
+- Pure white (#FFFFFF) background, no shadows on background.
+- Soft, even studio lighting from above.
+- Photorealistic rendering, 8K quality, sharp focus, professional catalog standard.
+- 100% ORIGINAL design — do not reproduce any existing real product.
+- Show EVERY structural detail clearly: legs, handles, drawers, cushions, edges, hardware, stitching, texture.
+
+This image will be used as a design reference to generate multiple views, so every detail must be crisp and unambiguous.`;
+};
+
+/**
+ * Builds a prompt for generating the 3-view turnaround using a reference image (Pass 2).
+ */
+export const buildTurnaroundFromRefPrompt = (prompt: string): string => {
+  const lowerPrompt = prompt.toLowerCase();
+  const needsElevatedView = /\b(rond|ronde|ronds|rondes|circulaire|ovale|ovales|cylindr|sphér|boule|dôme|round|circular|oval|cylinder|sphere|ball|dome|table\s+(ronde|basse|d'appoint|guéridon)|guéridon|pouf|tabouret|vase|bol|plateau|miroir\s+rond|lampe\s+(boule|champignon|globe)|abat-jour)\b/i.test(lowerPrompt);
+
+  const cameraAngle = needsElevatedView
+    ? `CAMERA ELEVATION: This object is round/oval/symmetrical. Use a SLIGHTLY ELEVATED camera (15-20° above eye level) for all 3 views to reveal the top surface.`
+    : `CAMERA ELEVATION: Straight-on eye-level camera for all 3 views.`;
+
+  return `TASK: Look at the attached reference image. It shows a single piece of furniture/object.
+You must create a NEW image showing THIS EXACT SAME OBJECT from exactly 3 angles.
+
+CRITICAL: The object in your output must be IDENTICAL to the one in the reference image.
+- Same EXACT shape, silhouette, and proportions
+- Same EXACT number of legs, handles, drawers, cushions, shelves — count them in the reference and match precisely
+- Same EXACT materials, colors, textures, wood grain, fabric weave
+- Same EXACT hardware, stitching, edge profiles, decorative details
+- Do NOT add, remove, or modify ANY detail. Copy the reference design exactly.
+
+OUTPUT FORMAT: One wide horizontal image with exactly 3 equal vertical panels side by side:
+
+  LEFT PANEL:   FRONT view (0° azimuth) — camera faces the object straight on
+  CENTER PANEL: RIGHT SIDE view (90° azimuth) — camera rotated 90° clockwise
+  RIGHT PANEL:  REAR view (180° azimuth) — camera sees the back of the object
+
+${cameraAngle}
+
+COMPOSITION:
+  • Pure white (#FFFFFF) background, no floor shadow
+  • Soft even studio lighting from above
+  • Each panel = exactly one third of the total width
+  • Object perfectly centered in each panel, same scale in all 3
+  • Thin light gray vertical lines separating panels
+
+FORBIDDEN: Any text, labels, watermarks. Any props or context objects. Any variation from the reference design.
+
+RENDERING: Photorealistic, 8K resolution, crisp focus, professional catalog quality.`;
+};
+
+/**
+ * Extracts base64 image data from a Gemini response.
+ */
+export const extractImageFromResponse = (response: any): string | null => {
+  if (response.candidates?.[0]?.content?.parts) {
+    for (const part of response.candidates[0].content.parts) {
+      if (part.inlineData?.data) {
+        return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+      }
+    }
+  }
+  return null;
 };
 
 /**
  * Generates an image for a specific prompt using the selected model.
- * Applies generic quality enhancements without assuming the subject.
+ * Supports two modes:
+ * - Standard: single-pass 3-view generation
+ * - High Coherence: two-pass (reference image + 3-view from reference)
  */
 export const generateImageForPrompt = async (
   prompt: string,
   imageSize: ImageSize = '1K',
-  model: ImageModel = 'gemini-3-pro-image-preview'
+  model: ImageModel = 'gemini-3-pro-image-preview',
+  highCoherence: boolean = false
 ): Promise<string> => {
   const ai = getAIClient();
 
-  const enhancedPrompt = buildEnhancedPrompt(prompt);
+  if (!highCoherence) {
+    // Standard single-pass mode
+    const enhancedPrompt = buildEnhancedPrompt(prompt);
 
-  const response = await ai.models.generateContent({
+    const response = await ai.models.generateContent({
+      model: model,
+      contents: {
+        parts: [{ text: enhancedPrompt }]
+      },
+      config: {
+        imageConfig: {
+          aspectRatio: "16:9",
+          imageSize: imageSize
+        }
+      }
+    });
+
+    const image = extractImageFromResponse(response);
+    if (image) return image;
+    throw new Error("No image generated");
+  }
+
+  // ═══ HIGH COHERENCE: Two-pass generation ═══
+
+  // PASS 1: Generate a single reference image of the object
+  const refPrompt = buildReferencePrompt(prompt);
+
+  const refResponse = await ai.models.generateContent({
     model: model,
     contents: {
-      parts: [{ text: enhancedPrompt }]
+      parts: [{ text: refPrompt }]
     },
+    config: {
+      imageConfig: {
+        aspectRatio: "1:1",
+        imageSize: "1K" // Reference doesn't need max resolution
+      }
+    }
+  });
+
+  const refImage = extractImageFromResponse(refResponse);
+  if (!refImage) {
+    throw new Error("Failed to generate reference image (pass 1)");
+  }
+
+  // Extract raw base64 for the API call
+  const refBase64 = refImage.split(',')[1];
+  const refMimeType = refImage.split(';')[0].split(':')[1] || 'image/png';
+
+  // PASS 2: Generate the 3-view turnaround using the reference image as input
+  const turnaroundPrompt = buildTurnaroundFromRefPrompt(prompt);
+
+  const turnaroundResponse = await ai.models.generateContent({
+    model: model,
+    contents: [
+      {
+        role: 'user',
+        parts: [
+          {
+            inlineData: {
+              data: refBase64,
+              mimeType: refMimeType,
+            }
+          },
+          { text: turnaroundPrompt }
+        ]
+      }
+    ],
     config: {
       imageConfig: {
         aspectRatio: "16:9",
@@ -222,13 +373,8 @@ export const generateImageForPrompt = async (
     }
   });
 
-  if (response.candidates?.[0]?.content?.parts) {
-      for (const part of response.candidates[0].content.parts) {
-          if (part.inlineData?.data) {
-              return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
-          }
-      }
-  }
+  const finalImage = extractImageFromResponse(turnaroundResponse);
+  if (finalImage) return finalImage;
 
-  throw new Error("No image generated");
+  throw new Error("Failed to generate 3-view turnaround from reference (pass 2)");
 };

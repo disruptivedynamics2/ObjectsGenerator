@@ -168,15 +168,109 @@ export const uploadImageToDrive = async (
 };
 
 /**
- * Uploads all batch results to Google Drive organized in folders by group.
+ * Finds or creates a folder by name inside an optional parent.
+ * Returns the existing folder ID if found, or creates a new one.
+ */
+const findOrCreateFolder = async (folderName: string, parentFolderId?: string): Promise<string> => {
+  const token = await authenticateGoogleDrive();
+
+  // Search for existing folder with this name in the parent
+  let query = `name='${folderName}' and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+  if (parentFolderId) {
+    query += ` and '${parentFolderId}' in parents`;
+  }
+
+  const searchUrl = `${DRIVE_FILES_URL}?q=${encodeURIComponent(query)}&fields=files(id,name)`;
+  const searchResponse = await fetch(searchUrl, {
+    headers: { 'Authorization': `Bearer ${token}` },
+  });
+
+  if (searchResponse.ok) {
+    const data = await searchResponse.json();
+    if (data.files && data.files.length > 0) {
+      return data.files[0].id;
+    }
+  }
+
+  // Not found, create it
+  return await createDriveFolder(folderName, parentFolderId);
+};
+
+/**
+ * Ensures the full folder hierarchy exists on Drive:
+ * ObjectGenerator / YYYY / MM_MonthName / commandName
+ * Returns the command folder ID.
+ */
+const ensureFolderStructure = async (commandName: string): Promise<string> => {
+  const now = new Date();
+  const year = now.getFullYear().toString();
+  const monthNames = [
+    'Janvier', 'Février', 'Mars', 'Avril', 'Mai', 'Juin',
+    'Juillet', 'Août', 'Septembre', 'Octobre', 'Novembre', 'Décembre'
+  ];
+  const monthFolder = `${String(now.getMonth() + 1).padStart(2, '0')}_${monthNames[now.getMonth()]}`;
+
+  // ObjectGenerator (root)
+  const rootId = await findOrCreateFolder('ObjectGenerator');
+  // YYYY
+  const yearId = await findOrCreateFolder(year, rootId);
+  // MM_MonthName
+  const monthId = await findOrCreateFolder(monthFolder, yearId);
+  // Command folder
+  const commandId = await findOrCreateFolder(commandName, monthId);
+
+  return commandId;
+};
+
+/**
+ * Uploads a file (PDF, etc.) to Google Drive.
+ */
+export const uploadFileToDrive = async (
+  blob: Blob,
+  fileName: string,
+  mimeType: string,
+  folderId: string
+): Promise<{ id: string; webViewLink: string }> => {
+  const token = await authenticateGoogleDrive();
+
+  const metadata = {
+    name: fileName,
+    parents: [folderId],
+    mimeType: mimeType,
+  };
+
+  const formData = new FormData();
+  formData.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+  formData.append('file', blob);
+
+  const response = await fetch(`${DRIVE_UPLOAD_URL}?uploadType=multipart&fields=id,webViewLink`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+    },
+    body: formData,
+  });
+
+  if (!response.ok) {
+    throw new Error(`Erreur upload fichier Drive: ${response.statusText}`);
+  }
+
+  return await response.json();
+};
+
+/**
+ * Uploads all batch results to Google Drive with structured folders:
+ * ObjectGenerator / YYYY / MM_MonthName / CommandName / [groups] / images + PDF
  */
 export const uploadBatchResultsToDrive = async (
   images: { groupName: string; itemName: string; base64: string }[],
-  rootFolderName: string,
-  onProgress?: (current: number, total: number) => void
+  commandName: string,
+  onProgress?: (current: number, total: number, step?: string) => void,
+  pdfBlob?: Blob
 ): Promise<string> => {
-  // Create root folder
-  const rootFolderId = await createDriveFolder(rootFolderName);
+  // Create folder structure: ObjectGenerator/Year/Month/Command
+  onProgress?.(0, images.length + (pdfBlob ? 1 : 0), 'Création des dossiers...');
+  const commandFolderId = await ensureFolderStructure(commandName);
 
   // Group images by group name
   const groupedImages = new Map<string, typeof images>();
@@ -186,21 +280,29 @@ export const uploadBatchResultsToDrive = async (
     groupedImages.set(img.groupName, existing);
   }
 
-  // Create subfolders and upload images
+  // Upload images in group subfolders
   let processed = 0;
-  const total = images.length;
+  const total = images.length + (pdfBlob ? 1 : 0);
 
   for (const [groupName, groupImages] of groupedImages) {
     const safeName = groupName.replace(/[^a-z0-9àâäéèêëïîôùûüÿçœæ\s-]/gi, '_').substring(0, 50);
-    const groupFolderId = await createDriveFolder(safeName, rootFolderId);
+    const groupFolderId = await createDriveFolder(safeName, commandFolderId);
 
     for (const img of groupImages) {
       const safeItemName = img.itemName.replace(/[^a-z0-9àâäéèêëïîôùûüÿçœæ\s-]/gi, '_').substring(0, 50);
       await uploadImageToDrive(img.base64, `${safeItemName}.png`, groupFolderId);
       processed++;
-      onProgress?.(processed, total);
+      onProgress?.(processed, total, `Images: ${processed}/${images.length}`);
     }
   }
 
-  return `https://drive.google.com/drive/folders/${rootFolderId}`;
+  // Upload PDF catalog if provided
+  if (pdfBlob) {
+    const dateStr = new Date().toISOString().split('T')[0];
+    await uploadFileToDrive(pdfBlob, `Catalogue_${commandName}_${dateStr}.pdf`, 'application/pdf', commandFolderId);
+    processed++;
+    onProgress?.(processed, total, 'PDF catalogue uploadé !');
+  }
+
+  return `https://drive.google.com/drive/folders/${commandFolderId}`;
 };

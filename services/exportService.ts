@@ -73,6 +73,24 @@ export const downloadMergedPdf = (groups: PromptGroup[], allImages: GeneratedIma
   doc.save(`Catalogue_Complet_${dateStr}.pdf`);
 };
 
+/**
+ * Generates a merged PDF as a Blob (for Drive upload) without triggering a download.
+ */
+export const generateMergedPdfBlob = (groups: PromptGroup[], allImages: GeneratedImage[]): Blob => {
+  if (!window.jspdf) throw new Error("jsPDF not loaded");
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
+
+  groups.forEach((group, index) => {
+    const groupImages = allImages.filter(img => img.groupId === group.id);
+    if (groupImages.length > 0) {
+      addGroupToPdf(doc, group, groupImages, index > 0);
+    }
+  });
+
+  return doc.output('blob');
+};
+
 // Helpers
 const downloadBlob = (blob: Blob, filename: string) => {
   const link = document.createElement("a");
