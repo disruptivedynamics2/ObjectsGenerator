@@ -33,6 +33,65 @@ let comfyuiUrl = DEFAULT_COMFYUI_URL;
 export const setComfyUIUrl = (url: string) => { comfyuiUrl = url; };
 export const getComfyUIUrl = () => comfyuiUrl;
 
+/**
+ * Cleans a full prompt to extract ONLY the physical object description.
+ * Removes all rendering instructions, view layout instructions, dimensions text,
+ * and anything that ComfyUI/Qwen would try to draw as text in the image.
+ *
+ * Input example:
+ * "Génère une planche produit montrant un canapé 3 places, revêtement bouclette ivoire,
+ *  4 pieds en chêne clair... Important : crée un design 100% original... Affiche l'objet
+ *  sous 3 vues distinctes... Longueur (cm) x Profondeur (cm) x Hauteur (cm) : 230 x 95 x 82."
+ *
+ * Output:
+ * "un canapé 3 places, revêtement bouclette ivoire, 4 pieds en chêne clair..."
+ */
+export const cleanPromptForComfyUI = (prompt: string): string => {
+  let cleaned = prompt;
+
+  // Remove the opening "Génère une planche produit montrant" prefix
+  cleaned = cleaned.replace(/^G[ée]n[èe]re une planche produit montrant\s*/i, '');
+
+  // Remove everything after "Important :" (the rendering/legal clause)
+  const importantIdx = cleaned.indexOf('Important');
+  if (importantIdx > 20) {
+    cleaned = cleaned.substring(0, importantIdx).trim();
+  }
+
+  // Remove dimensions line if it somehow survived
+  cleaned = cleaned.replace(/Sous les 3 vues.*$/i, '');
+  cleaned = cleaned.replace(/Longueur\s*\(cm\).*$/i, '');
+  cleaned = cleaned.replace(/Long\s*\(cm\).*$/i, '');
+  cleaned = cleaned.replace(/\d+\s*x\s*\d+\s*x\s*\d+\s*(cm)?\.?\s*$/i, '');
+
+  // Remove view instructions
+  cleaned = cleaned.replace(/Affiche l'objet.*$/i, '');
+  cleaned = cleaned.replace(/sous\s*3\s*vues\s*distinctes.*$/i, '');
+  cleaned = cleaned.replace(/de face,?\s*de côté.*$/i, '');
+  cleaned = cleaned.replace(/côte à côte.*$/i, '');
+  cleaned = cleaned.replace(/rendu photoréaliste.*$/i, '');
+  cleaned = cleaned.replace(/éclairage studio.*$/i, '');
+  cleaned = cleaned.replace(/fond blanc.*$/i, '');
+  cleaned = cleaned.replace(/sans ombres.*$/i, '');
+  cleaned = cleaned.replace(/sans logo.*$/i, '');
+  cleaned = cleaned.replace(/sans humains.*$/i, '');
+  cleaned = cleaned.replace(/sans éléments décoratifs.*$/i, '');
+
+  // Remove trailing punctuation and whitespace
+  cleaned = cleaned.replace(/[,.\s]+$/, '').trim();
+
+  // If cleaning removed too much, fall back to original but strip dimensions
+  if (cleaned.length < 20) {
+    cleaned = prompt
+      .replace(/Important\s*:.*$/is, '')
+      .replace(/Longueur.*$/i, '')
+      .replace(/\d+\s*x\s*\d+\s*x\s*\d+.*$/i, '')
+      .trim();
+  }
+
+  return cleaned;
+};
+
 export const isComfyUIAvailable = async (): Promise<boolean> => {
   try {
     const r = await fetch(`${comfyuiUrl}/system_stats`, { signal: AbortSignal.timeout(3000) });

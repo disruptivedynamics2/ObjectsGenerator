@@ -9,7 +9,7 @@ import { authenticateGoogleDrive, isDriveAuthenticated, uploadBatchResultsToDriv
 import { verifyAllImages, filterConsistentImages, VerificationResult } from './services/viewVerificationService';
 import { backupBatchJob, restoreBatchJob, restoreBatchFromFile, hasBatchBackup, clearBatchBackup } from './services/batchPersistenceService';
 import { getBatchJobStatus, getBatchJobResults } from './services/batchService';
-import { generateWithComfyUI, isComfyUIAvailable, generateReferenceWithQwen } from './services/comfyuiService';
+import { generateWithComfyUI, isComfyUIAvailable, generateReferenceWithQwen, cleanPromptForComfyUI } from './services/comfyuiService';
 import { ApiKeySelector } from './components/ApiKeySelector';
 import { PromptGenerator } from './components/PromptGenerator';
 import { PromptGroup, GeneratedImage, AppState, ImageSize, ImageModel, GenerationMode, GenerationBackend, ComfyUIModelPreset, BatchJob, BatchJobState } from './types';
@@ -111,18 +111,22 @@ const App: React.FC = () => {
   // Returns a GeneratedImage-compatible object with optional slide2 for 6-view mode
   const generateImage = async (prompt: string): Promise<{ base64: string; base64Slide2?: string; individualViews?: string[] }> => {
     if (backend === 'comfyui') {
+      // Clean the prompt: remove rendering instructions, dimensions, view layout
+      // ComfyUI only needs the physical description of the object
+      const cleanedPrompt = cleanPromptForComfyUI(prompt);
+
       // Step 1: Generate reference image (Gemini or Qwen local)
       let refImage: string;
       if (comfyRefSource === 'qwen') {
         // 100% local, 0€
-        refImage = await generateReferenceWithQwen(prompt);
+        refImage = await generateReferenceWithQwen(cleanedPrompt);
       } else {
-        // Gemini for reference (1 API call)
-        refImage = await generateImageForPrompt(prompt, '1K', selectedModel, false);
+        // Gemini for reference — use the cleaned prompt for a single object image
+        refImage = await generateImageForPrompt(cleanedPrompt, '1K', selectedModel, false);
       }
 
-      // Step 2: Generate 6 views via ComfyUI
-      const result = await generateWithComfyUI(refImage, prompt);
+      // Step 2: Generate 6 views via ComfyUI (uses only the object description)
+      const result = await generateWithComfyUI(refImage, cleanedPrompt);
 
       return {
         base64: result.slide1,
