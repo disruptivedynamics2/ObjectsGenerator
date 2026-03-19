@@ -9,9 +9,10 @@ import { authenticateGoogleDrive, isDriveAuthenticated, uploadBatchResultsToDriv
 import { verifyAllImages, filterConsistentImages, VerificationResult } from './services/viewVerificationService';
 import { backupBatchJob, restoreBatchJob, restoreBatchFromFile, hasBatchBackup, clearBatchBackup } from './services/batchPersistenceService';
 import { getBatchJobStatus, getBatchJobResults } from './services/batchService';
+import { generateWithComfyUI, isComfyUIAvailable, MODEL_PRESETS } from './services/comfyuiService';
 import { ApiKeySelector } from './components/ApiKeySelector';
 import { PromptGenerator } from './components/PromptGenerator';
-import { PromptGroup, GeneratedImage, AppState, ImageSize, ImageModel, GenerationMode, BatchJob, BatchJobState } from './types';
+import { PromptGroup, GeneratedImage, AppState, ImageSize, ImageModel, GenerationMode, GenerationBackend, ComfyUIModelPreset, BatchJob, BatchJobState } from './types';
 
 // Pricing per image (verified from official Google API docs)
 const PRICING = {
@@ -40,6 +41,9 @@ const App: React.FC = () => {
   const [selectedModel, setSelectedModel] = useState<ImageModel>('gemini-3.1-flash-image-preview');
   const [generationMode, setGenerationMode] = useState<GenerationMode>('realtime');
   const [highCoherence, setHighCoherence] = useState(true);
+  const [backend, setBackend] = useState<GenerationBackend>('gemini');
+  const [comfyPreset, setComfyPreset] = useState<ComfyUIModelPreset>('flux2-multiangle');
+  const [comfyAvailable, setComfyAvailable] = useState<boolean | null>(null);
 
   const [generatedImages, setGeneratedImages] = useState<GeneratedImage[]>([]);
   const [allGeneratedImages, setAllGeneratedImages] = useState<GeneratedImage[]>([]);
@@ -94,6 +98,21 @@ const App: React.FC = () => {
       currency: '$'
     };
   }, [selectedModel, selectedResolution]);
+
+  // Check ComfyUI availability when backend changes
+  useEffect(() => {
+    if (backend === 'comfyui') {
+      isComfyUIAvailable().then(setComfyAvailable);
+    }
+  }, [backend]);
+
+  // Unified image generation — picks Gemini or ComfyUI
+  const generateImage = async (prompt: string): Promise<string> => {
+    if (backend === 'comfyui') {
+      return await generateWithComfyUI(prompt, selectedResolution, comfyPreset, highCoherence);
+    }
+    return await generateImageForPrompt(prompt, selectedResolution, selectedModel, highCoherence);
+  };
 
   // --- File handling (click + drag & drop) ---
 
@@ -174,7 +193,7 @@ const App: React.FC = () => {
 
         while (attempts < maxAttempts) {
           try {
-            base64 = await generateImageForPrompt(item.prompt, selectedResolution, selectedModel, highCoherence);
+            base64 = await generateImage(item.prompt);
             break;
           } catch (err: any) {
             attempts++;
@@ -242,7 +261,7 @@ const App: React.FC = () => {
 
           while (attempts < maxAttempts) {
             try {
-              base64 = await generateImageForPrompt(item.prompt, selectedResolution, selectedModel, highCoherence);
+              base64 = await generateImage(item.prompt);
               break;
             } catch (err: any) {
               attempts++;
@@ -886,6 +905,72 @@ const App: React.FC = () => {
                     ))}
                   </div>
                 </div>
+              </div>
+
+              {/* Backend Selector: Gemini vs ComfyUI */}
+              <div>
+                <span className="text-sm font-bold text-slate-400 uppercase tracking-widest mb-3 block">Backend de génération</span>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <button
+                    onClick={() => setBackend('gemini')}
+                    className={`flex items-start gap-3 p-4 rounded-xl border-2 transition-all text-left ${
+                      backend === 'gemini' ? 'border-indigo-600 bg-indigo-50' : 'border-slate-100 hover:border-slate-200'
+                    }`}
+                  >
+                    <CloudUpload className={`w-5 h-5 mt-0.5 ${backend === 'gemini' ? 'text-indigo-600' : 'text-slate-400'}`} />
+                    <div>
+                      <span className={`font-bold block ${backend === 'gemini' ? 'text-indigo-700' : 'text-slate-700'}`}>Gemini (Cloud)</span>
+                      <span className="text-xs text-slate-500">API Google — payant, haute qualité, batch -50% disponible</span>
+                    </div>
+                  </button>
+                  <button
+                    onClick={() => setBackend('comfyui')}
+                    className={`flex items-start gap-3 p-4 rounded-xl border-2 transition-all text-left ${
+                      backend === 'comfyui' ? 'border-orange-600 bg-orange-50' : 'border-slate-100 hover:border-slate-200'
+                    }`}
+                  >
+                    <Monitor className={`w-5 h-5 mt-0.5 ${backend === 'comfyui' ? 'text-orange-600' : 'text-slate-400'}`} />
+                    <div>
+                      <span className={`font-bold block ${backend === 'comfyui' ? 'text-orange-700' : 'text-slate-700'}`}>
+                        ComfyUI (Local)
+                        <span className="ml-2 text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded-full">Gratuit</span>
+                      </span>
+                      <span className="text-xs text-slate-500">Votre GPU — RTX 4090, 0€ de coût API</span>
+                    </div>
+                  </button>
+                </div>
+
+                {/* ComfyUI preset selector */}
+                {backend === 'comfyui' && (
+                  <div className="mt-3 space-y-3">
+                    {comfyAvailable === false && (
+                      <div className="bg-red-50 border border-red-200 rounded-lg p-3 flex items-center gap-2">
+                        <AlertCircle className="w-4 h-4 text-red-500" />
+                        <span className="text-sm text-red-700">ComfyUI non détecté sur localhost:8188. Lancez ComfyUI Studio d'abord.</span>
+                      </div>
+                    )}
+                    {comfyAvailable === true && (
+                      <div className="bg-green-50 border border-green-200 rounded-lg p-2 flex items-center gap-2">
+                        <CheckCircle2 className="w-4 h-4 text-green-500" />
+                        <span className="text-xs text-green-700">ComfyUI connecté</span>
+                      </div>
+                    )}
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                      {MODEL_PRESETS.map(p => (
+                        <button
+                          key={p.id}
+                          onClick={() => setComfyPreset(p.id)}
+                          className={`p-3 rounded-lg border-2 text-left transition-all ${
+                            comfyPreset === p.id ? 'border-orange-500 bg-orange-50' : 'border-slate-100 hover:border-slate-200'
+                          }`}
+                        >
+                          <span className={`font-bold text-sm block ${comfyPreset === p.id ? 'text-orange-800' : 'text-slate-700'}`}>{p.name}</span>
+                          <span className="text-[10px] text-slate-500 block mt-1">{p.description}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* Generation Mode Selector */}

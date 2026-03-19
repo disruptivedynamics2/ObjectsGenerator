@@ -1,6 +1,8 @@
 export type ImageSize = '512px' | '1K' | '2K' | '4K';
 export type ImageModel = 'gemini-3.1-flash-image-preview' | 'gemini-3-pro-image-preview';
 export type GenerationMode = 'realtime' | 'batch';
+export type GenerationBackend = 'gemini' | 'comfyui';
+export type ComfyUIModelPreset = 'flux2-multiangle' | 'sd3-mvadapter' | 'qwen-image-edit';
 
 export interface CostEstimation {
   perImage: number;
