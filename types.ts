@@ -24,6 +24,8 @@ export interface PromptGroup {
   items: PromptItem[];
 }
 
+export type ViewName = 'front' | 'side' | 'rear';
+
 export interface GeneratedImage {
   groupId: number;
   itemId: number;
@@ -34,6 +36,8 @@ export interface GeneratedImage {
   base64Slide2?: string;
   /** All 6 individual view images — only present for ComfyUI 6-view mode */
   individualViews?: string[];
+  /** Which views are kept after verification (undefined = all 3 views present) */
+  keptViews?: ViewName[];
 }
 
 export interface BatchJob {

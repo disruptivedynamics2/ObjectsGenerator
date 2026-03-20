@@ -6,7 +6,7 @@ import { analyzePdfContent, generateImageForPrompt } from './services/geminiServ
 import { downloadZip, downloadPdf, downloadGlobalZip, downloadMergedPdf, generateMergedPdfBlob } from './services/exportService';
 import { createBatchJob, createHighCoherenceBatchJob, pollBatchJob, cancelBatchJob } from './services/batchService';
 import { authenticateGoogleDrive, isDriveAuthenticated, uploadBatchResultsToDrive } from './services/driveService';
-import { verifyAllImages, filterConsistentImages, VerificationResult } from './services/viewVerificationService';
+import { verifyAllImages, filterConsistentImages, processVerificationResults, VerificationResult } from './services/viewVerificationService';
 import { backupBatchJob, restoreBatchJob, restoreBatchFromFile, hasBatchBackup, clearBatchBackup } from './services/batchPersistenceService';
 import { getBatchJobStatus, getBatchJobResults } from './services/batchService';
 import { generateWithComfyUI, isComfyUIAvailable, generateReferenceWithQwen, cleanPromptForComfyUI } from './services/comfyuiService';
@@ -65,6 +65,8 @@ const App: React.FC = () => {
   const [verificationResults, setVerificationResults] = useState<VerificationResult[]>([]);
   const [verificationProgress, setVerificationProgress] = useState<{ current: number; total: number; currentItem: string } | null>(null);
   const [rejectedImages, setRejectedImages] = useState<GeneratedImage[]>([]);
+  const [trimmedViewsCount, setTrimmedViewsCount] = useState(0);
+  const [fullyRejectedCount, setFullyRejectedCount] = useState(0);
 
   // Batch backup state
   const [hasBackup, setHasBackup] = useState(hasBatchBackup());
@@ -339,26 +341,19 @@ const App: React.FC = () => {
         setVerificationResults(verResults);
         setVerificationProgress(null);
 
-        // Separate consistent and rejected images
-        const { consistent, rejected } = filterConsistentImages(allImages, verResults);
-        setRejectedImages(rejected);
-
-        const rejectedCount = rejected.length;
-        if (rejectedCount > 0) {
-          setError(`${rejectedCount} image(s) rejetée(s) pour incohérence entre les vues. Elles sont exclues du catalogue PDF.`);
-        }
+        // Process: trim bad views instead of rejecting whole objects
+        await handlePostVerification(allImages, verResults, setAllGeneratedImages);
 
         setAppState(AppState.FINISHED_ALL);
 
-        // Step 3: Auto-download ZIP (all images) and PDF (only consistent ones)
-        setTimeout(() => { downloadGlobalZip(groups, allImages); }, 500);
-        if (consistent.length > 0) {
-          setTimeout(() => { downloadMergedPdf(groups, consistent); }, 2000);
-        }
+        // Step 3: Auto-download ZIP and PDF (all images, with trimmed views)
+        const currentImages = allImages; // will be updated in state but use local ref
+        setTimeout(() => { downloadGlobalZip(groups, currentImages); }, 500);
+        setTimeout(() => { downloadMergedPdf(groups, currentImages); }, 2000);
 
         // Step 4: Auto-upload to Drive
         if (isDriveAuthenticated()) {
-          await autoUploadToDrive(allImages, consistent);
+          await autoUploadToDrive(currentImages, currentImages);
         }
       }
     } catch (err: any) {
@@ -453,12 +448,8 @@ const App: React.FC = () => {
       setVerificationResults(verResults);
       setVerificationProgress(null);
 
-      const { consistent, rejected } = filterConsistentImages(images, verResults);
-      setRejectedImages(rejected);
-
-      if (rejected.length > 0) {
-        setError(`${rejected.length} image(s) rejetée(s) pour incohérence entre les vues.`);
-      }
+      // Process: trim bad views instead of rejecting whole objects
+      await handlePostVerification(images, verResults, setAllGeneratedImages);
 
       setAppState(AppState.FINISHED_ALL);
 
@@ -468,7 +459,7 @@ const App: React.FC = () => {
 
       // Auto-upload to Drive if authenticated
       if (isDriveAuthenticated() && images.length > 0) {
-        await autoUploadToDrive(images, consistent);
+        await autoUploadToDrive(images, images);
       }
 
     } catch (err: any) {
@@ -556,11 +547,8 @@ const App: React.FC = () => {
         setVerificationResults(verResults);
         setVerificationProgress(null);
 
-        const { consistent, rejected } = filterConsistentImages(images, verResults);
-        setRejectedImages(rejected);
-        if (rejected.length > 0) {
-          setError(`${rejected.length} image(s) rejetée(s) pour incohérence.`);
-        }
+        // Process: trim bad views instead of rejecting whole objects
+        await handlePostVerification(images, verResults, setAllGeneratedImages);
 
         setAppState(AppState.FINISHED_ALL);
         clearBatchBackup();
@@ -568,7 +556,7 @@ const App: React.FC = () => {
 
         // Auto-upload to Drive
         if (isDriveAuthenticated() && images.length > 0) {
-          await autoUploadToDrive(images, consistent);
+          await autoUploadToDrive(images, images);
         }
 
       } else if (status.state === 'JOB_STATE_FAILED' || status.state === 'JOB_STATE_CANCELLED') {
@@ -612,18 +600,15 @@ const App: React.FC = () => {
         setVerificationResults(verResults);
         setVerificationProgress(null);
 
-        const { consistent, rejected } = filterConsistentImages(images, verResults);
-        setRejectedImages(rejected);
-        if (rejected.length > 0) {
-          setError(`${rejected.length} image(s) rejetée(s) pour incohérence.`);
-        }
+        // Process: trim bad views instead of rejecting whole objects
+        await handlePostVerification(images, verResults, setAllGeneratedImages);
 
         setAppState(AppState.FINISHED_ALL);
         clearBatchBackup();
         setHasBackup(false);
 
         if (isDriveAuthenticated() && images.length > 0) {
-          await autoUploadToDrive(images, consistent);
+          await autoUploadToDrive(images, images);
         }
       }
     } catch (err: any) {
@@ -745,7 +730,39 @@ const App: React.FC = () => {
     setVerificationResults([]);
     setVerificationProgress(null);
     setRejectedImages([]);
+    setTrimmedViewsCount(0);
+    setFullyRejectedCount(0);
     setAppState(AppState.SELECTING);
+  };
+
+  /**
+   * Helper: after verification, process images to trim bad views instead of rejecting whole objects.
+   * Updates state with processed images and stats.
+   */
+  const handlePostVerification = async (
+    images: GeneratedImage[],
+    verResults: VerificationResult[],
+    setImages: (imgs: GeneratedImage[]) => void
+  ) => {
+    // Process: crop out bad views, keep objects with remaining good views
+    const { processed, trimmedCount, fullyRejectedCount: fullReject } = await processVerificationResults(images, verResults);
+    setImages(processed);
+    setTrimmedViewsCount(trimmedCount);
+    setFullyRejectedCount(fullReject);
+
+    // Legacy: also compute rejected list for backward compat (fully rejected only)
+    const fullyRejected = images.filter(img => {
+      const r = verResults.find(v => v.groupId === img.groupId && v.itemId === img.itemId);
+      return r && !r.isConsistent && r.keptViews.length === 0;
+    });
+    setRejectedImages(fullyRejected);
+
+    if (trimmedCount > 0 || fullReject > 0) {
+      const parts: string[] = [];
+      if (trimmedCount > 0) parts.push(`${trimmedCount} objet(s) avec vue(s) supprimée(s)`);
+      if (fullReject > 0) parts.push(`${fullReject} objet(s) entièrement rejeté(s)`);
+      setError(parts.join(', ') + '.');
+    }
   };
 
   // --- Render ---
@@ -1385,8 +1402,11 @@ const App: React.FC = () => {
                 </h2>
                 <p className="text-slate-500 mt-1">
                   {allGeneratedImages.length} images générées en {selectedResolution}
-                  {rejectedImages.length > 0 && (
-                    <span className="text-amber-600"> — {allGeneratedImages.length - rejectedImages.length} validées, {rejectedImages.length} rejetée(s)</span>
+                  {trimmedViewsCount > 0 && (
+                    <span className="text-amber-600"> — {trimmedViewsCount} objet(s) avec vue(s) supprimée(s)</span>
+                  )}
+                  {fullyRejectedCount > 0 && (
+                    <span className="text-red-500"> — {fullyRejectedCount} entièrement rejeté(s)</span>
                   )}
                 </p>
               </div>
@@ -1395,8 +1415,7 @@ const App: React.FC = () => {
                   <Download className="w-5 h-5 mr-2" /> ZIP Complet
                 </button>
                 <button onClick={() => {
-                  const { consistent } = filterConsistentImages(allGeneratedImages, verificationResults);
-                  downloadMergedPdf(groups, consistent.length > 0 ? consistent : allGeneratedImages);
+                  downloadMergedPdf(groups, allGeneratedImages);
                 }} className="flex-1 lg:flex-none inline-flex items-center justify-center px-6 py-3 bg-indigo-600 text-white rounded-xl font-bold shadow-lg hover:bg-indigo-700 shadow-indigo-500/30 transition-all">
                   <FileText className="w-5 h-5 mr-2" /> PDF Catalogue
                 </button>
@@ -1411,8 +1430,7 @@ const App: React.FC = () => {
                   </div>
                 ) : driveAutoStatus === 'error' ? (
                   <button onClick={() => {
-                    const { consistent } = filterConsistentImages(allGeneratedImages, verificationResults);
-                    autoUploadToDrive(allGeneratedImages, consistent);
+                    autoUploadToDrive(allGeneratedImages, allGeneratedImages);
                   }} className="flex-1 lg:flex-none inline-flex items-center justify-center px-6 py-3 bg-red-50 text-red-600 rounded-xl font-bold border-2 border-red-200 hover:bg-red-100 transition-all">
                     <AlertCircle className="w-5 h-5 mr-2" /> Réessayer Drive
                   </button>
@@ -1441,18 +1459,39 @@ const App: React.FC = () => {
               </div>
             )}
 
-            {/* Verification summary */}
-            {rejectedImages.length > 0 && (
+            {/* Verification summary — trimmed views and fully rejected */}
+            {(trimmedViewsCount > 0 || fullyRejectedCount > 0) && (
               <div className="mb-6 bg-amber-50 border border-amber-200 rounded-xl p-4">
                 <div className="flex items-center gap-2 mb-2">
                   <AlertCircle className="w-5 h-5 text-amber-600" />
-                  <span className="text-amber-800 font-bold">{rejectedImages.length} objet(s) rejeté(s) — vues incohérentes</span>
+                  <span className="text-amber-800 font-bold">Vérification des vues terminée</span>
                 </div>
-                <p className="text-amber-700 text-sm mb-3">Ces images ont été exclues du PDF catalogue car les 3 vues ne montrent pas exactement le même objet.</p>
-                <div className="space-y-2">
+                {trimmedViewsCount > 0 && (
+                  <p className="text-amber-700 text-sm mb-2">{trimmedViewsCount} objet(s) conservé(s) avec vue(s) incohérente(s) supprimée(s).</p>
+                )}
+                {fullyRejectedCount > 0 && (
+                  <p className="text-red-600 text-sm mb-2">{fullyRejectedCount} objet(s) dont toutes les vues sont incohérentes.</p>
+                )}
+                <div className="space-y-2 mt-3">
                   {verificationResults.filter(r => !r.isConsistent).map((r, idx) => (
                     <div key={idx} className="bg-white rounded-lg p-3 border border-amber-100">
-                      <span className="font-bold text-slate-800">{r.itemName}</span>
+                      <div className="flex items-center gap-2">
+                        <span className="font-bold text-slate-800">{r.itemName}</span>
+                        {r.keptViews.length > 0 ? (
+                          <span className="bg-amber-100 text-amber-700 text-[10px] px-2 py-0.5 rounded-full font-bold">
+                            {r.keptViews.length}/3 vues conservées
+                          </span>
+                        ) : (
+                          <span className="bg-red-100 text-red-700 text-[10px] px-2 py-0.5 rounded-full font-bold">
+                            Toutes vues rejetées
+                          </span>
+                        )}
+                      </div>
+                      {r.problematicViews.length > 0 && (
+                        <p className="text-amber-600 text-xs mt-1">
+                          Vues supprimées : {r.problematicViews.map(v => v === 'front' ? 'Face' : v === 'side' ? 'Profil' : 'Arrière').join(', ')}
+                        </p>
+                      )}
                       <ul className="mt-1 text-sm text-amber-700">
                         {r.issues.map((issue, i) => (
                           <li key={i}>• {issue}</li>
@@ -1477,28 +1516,38 @@ const App: React.FC = () => {
                     <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                       {pImgs.map((img, idx) => {
                         const verResult = verificationResults.find(r => r.groupId === img.groupId && r.itemId === img.itemId);
-                        const isRejected = verResult && !verResult.isConsistent;
+                        const isFullyRejected = verResult && !verResult.isConsistent && verResult.keptViews.length === 0;
+                        const isTrimmed = verResult && !verResult.isConsistent && verResult.keptViews.length > 0;
+                        const viewLabelMap: Record<string, string> = { front: 'FACE', side: 'PROFIL', rear: 'ARRIÈRE' };
+                        const displayedViews = img.keptViews || ['front', 'side', 'rear'];
                         return (
-                          <div key={idx} className={`group relative rounded-xl overflow-hidden shadow-md ${isRejected ? 'ring-2 ring-red-400 opacity-70' : ''}`}>
+                          <div key={idx} className={`group relative rounded-xl overflow-hidden shadow-md ${isFullyRejected ? 'ring-2 ring-red-400 opacity-50' : isTrimmed ? 'ring-2 ring-amber-400' : ''}`}>
                             <img src={img.base64} alt="preview" className="w-full aspect-video object-cover" />
                             <div className="absolute top-2 right-2 bg-black/40 text-white text-[10px] px-1.5 py-0.5 rounded backdrop-blur-sm">{img.resolution}</div>
                             {/* Verification badge */}
                             <div className="absolute top-2 left-2">
-                              {isRejected ? (
-                                <span className="bg-red-500 text-white text-[10px] px-2 py-0.5 rounded-full font-bold">REJETÉ</span>
+                              {isFullyRejected ? (
+                                <span className="bg-red-500 text-white text-[10px] px-2 py-0.5 rounded-full font-bold">TOUTES VUES REJETÉES</span>
+                              ) : isTrimmed ? (
+                                <span className="bg-amber-500 text-white text-[10px] px-2 py-0.5 rounded-full font-bold">{verResult.keptViews.length}/3 VUES</span>
                               ) : verResult?.isConsistent ? (
                                 <span className="bg-green-500 text-white text-[10px] px-2 py-0.5 rounded-full font-bold">VALIDÉ</span>
                               ) : null}
                             </div>
                             <div className="absolute bottom-0 left-0 right-0 bg-black/40 backdrop-blur-sm flex justify-between px-2 py-1 text-[8px] font-bold text-white/80">
-                              <span>FACE</span>
-                              <span>PROFIL</span>
-                              <span>ARRIÈRE</span>
+                              {displayedViews.map(v => (
+                                <span key={v}>{viewLabelMap[v] || v.toUpperCase()}</span>
+                              ))}
                             </div>
                             <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center p-2 text-center">
                               <div>
                                 <span className="text-white text-xs font-medium block">{group.items[img.itemId].name}</span>
-                                {isRejected && verResult?.issues && (
+                                {isTrimmed && verResult?.problematicViews && (
+                                  <span className="text-amber-300 text-[10px] block mt-1">
+                                    Vues supprimées : {verResult.problematicViews.map(v => viewLabelMap[v] || v).join(', ')}
+                                  </span>
+                                )}
+                                {isFullyRejected && verResult?.issues && (
                                   <span className="text-red-300 text-[10px] block mt-1">{verResult.issues.join(', ')}</span>
                                 )}
                               </div>

@@ -158,15 +158,17 @@ const addSlideToDoc = (
     console.error("Error adding image to PDF", e);
   }
 
-  // View labels
+  // View labels — dynamic positioning based on number of views
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(10);
   doc.setTextColor(50);
   const labelY = 18 + imgHeight + 8;
-  if (viewLabels.length >= 3) {
-    doc.text(viewLabels[0], margin + (imgWidth / 6), labelY, { align: 'center' });
-    doc.text(viewLabels[1], margin + (imgWidth / 2), labelY, { align: 'center' });
-    doc.text(viewLabels[2], margin + (5 * imgWidth / 6), labelY, { align: 'center' });
+  const numLabels = viewLabels.length;
+  if (numLabels > 0) {
+    for (let li = 0; li < numLabels; li++) {
+      const xPos = margin + (imgWidth / numLabels) * (li + 0.5);
+      doc.text(viewLabels[li], xPos, labelY, { align: 'center' });
+    }
   }
 
   // Dimensions
@@ -209,14 +211,27 @@ const addGroupToPdf = (doc: any, group: PromptGroup, images: GeneratedImage[], f
 
   doc.addPage();
 
+  // View label map for standard 3-view mode
+  const VIEW_LABEL_MAP: Record<string, string> = {
+    'front': 'VUE DE FACE (0°)',
+    'side': 'VUE DE PROFIL DROIT (90°)',
+    'rear': 'VUE ARRIÈRE (180°)',
+  };
+
   // Images
   images.forEach((img, index) => {
     if (index > 0) doc.addPage();
 
-    // Slide 1 — always present (views 1-3 or the standard 3-view)
-    const slide1Labels = img.base64Slide2
-      ? ['3/4 AVANT HAUT', '3/4 AVANT BAS', '3/4 ARRIÈRE HAUT']
-      : ['VUE DE FACE (0°)', 'VUE DE PROFIL DROIT (90°)', 'VUE ARRIÈRE (180°)'];
+    // Slide 1 — compute labels based on kept views
+    let slide1Labels: string[];
+    if (img.base64Slide2) {
+      slide1Labels = ['3/4 AVANT HAUT', '3/4 AVANT BAS', '3/4 ARRIÈRE HAUT'];
+    } else if (img.keptViews && img.keptViews.length < 3) {
+      // Only show labels for kept views
+      slide1Labels = img.keptViews.map(v => VIEW_LABEL_MAP[v] || v.toUpperCase());
+    } else {
+      slide1Labels = ['VUE DE FACE (0°)', 'VUE DE PROFIL DROIT (90°)', 'VUE ARRIÈRE (180°)'];
+    }
 
     addSlideToDoc(doc, img, img.base64, slide1Labels, group, img.base64Slide2 ? 'Vues 1-3' : undefined);
 

@@ -304,9 +304,9 @@ export const PromptGenerator: React.FC<PromptGeneratorProps> = ({ onPromptsGener
               <input
                 type="number"
                 value={count}
-                onChange={e => setCount(Math.max(1, Math.min(100, parseInt(e.target.value) || 1)))}
+                onChange={e => setCount(Math.max(1, Math.min(1000, parseInt(e.target.value) || 1)))}
                 min={1}
-                max={100}
+                max={1000}
                 className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-violet-500 focus:border-transparent"
               />
             </div>
